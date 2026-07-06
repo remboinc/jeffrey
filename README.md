@@ -34,6 +34,7 @@ pip install -e ".[dev]"
 jeffrey scan --build-log ./jenkins.log
 jeffrey scan --build-log ./jenkins.log --no-k8s
 jeffrey scan --build-log ./jenkins.log --show-commands
+jeffrey scan --build-log ./jenkins.log --verbose
 jeffrey scan --build-log ./jenkins.log --debug
 jeffrey scan --build-log ./jenkins.log --save-report report.md
 ```
@@ -101,11 +102,24 @@ Print the `kubectl` commands Jeffrey runs:
 jeffrey scan --build-log ./jenkins.log --show-commands
 ```
 
+Print the concise report plus a compact investigation summary:
+
+```bash
+jeffrey scan --build-log ./jenkins.log --verbose
+```
+
 Print detailed debug output:
 
 ```bash
 jeffrey scan --build-log ./jenkins.log --debug
 ```
+
+Output modes:
+
+- default: concise report
+- `--verbose`: concise report plus compact summary
+- `--debug`: full internal investigation trace
+- `--show-commands`: executed shell commands only
 
 Save a Markdown report:
 

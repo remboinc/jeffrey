@@ -136,24 +136,25 @@ class KubernetesCollector:
         check.kubectl_found = version.exit_code is not None
         if check.kubectl_found:
             check.messages.append("kubectl found")
-            self.console.print("[green]✓[/green] kubectl found")
+            self.debug_fn("kubectl found")
         else:
             check.messages.append("kubectl is not installed or not on PATH")
+            self.debug_fn("kubectl is not installed or not on PATH")
 
         kubeconfig_path = os.environ.get("KUBECONFIG") or str(Path.home() / ".kube" / "config")
         check.kubeconfig_loaded = Path(kubeconfig_path).exists()
         if check.kubeconfig_loaded:
             check.messages.append("kubeconfig loaded")
-            self.console.print("[green]✓[/green] kubeconfig loaded")
+            self.debug_fn("kubeconfig loaded")
         else:
             check.messages.append(f"kubeconfig not found at {kubeconfig_path}")
+            self.debug_fn(f"kubeconfig not found at {kubeconfig_path}")
 
         context = self._run(["kubectl", "config", "current-context"])
         check.commands.append(context)
         if context.succeeded and context.stdout.strip():
             check.current_context = context.stdout.strip()
-            self.console.print("[green]✓[/green] current context:")
-            self.console.print(check.current_context)
+            self.debug_fn(f"current context:\n{check.current_context}")
 
         namespace = self._run(
             ["kubectl", "config", "view", "--minify", "--output", "jsonpath={..namespace}"]
@@ -171,6 +172,10 @@ class KubernetesCollector:
         self.debug_fn("Running:\n" + " ".join(command))
         result = run_command(command, timeout=self.timeout)
         self.debug_fn(f"kubectl exit code: {result.exit_code}")
+        if result.stderr.strip():
+            self.debug_fn(f"kubectl stderr:\n{result.stderr.strip()}")
+        if result.timed_out:
+            self.debug_fn("kubectl command timed out")
         return result
 
     @staticmethod

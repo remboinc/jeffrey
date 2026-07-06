@@ -15,13 +15,14 @@ def print_report(
     *,
     console: Console | None = None,
     show_all: bool = False,
+    verbose: bool = False,
 ) -> None:
     console = console or Console()
     console.print("[bold]Jeffrey investigation report[/bold]")
     console.print()
 
     if result.is_success and not result.has_findings:
-        _print_success(result, console)
+        _print_success(result, console, verbose=verbose)
         return
 
     if not result.has_findings:
@@ -48,8 +49,11 @@ def print_report(
         for finding in other_findings:
             console.print(f"- {finding.title}")
 
-    console.print()
-    _print_investigation_summary(result, console)
+    _print_raw_evidence_path(result, console)
+
+    if verbose:
+        console.print()
+        _print_compact_summary(result, console)
 
 
 def _print_finding(finding: Finding, console: Console, *, heading: str) -> None:
@@ -72,16 +76,12 @@ def _print_finding(finding: Finding, console: Console, *, heading: str) -> None:
 
     console.print()
     console.print("[bold]Evidence:[/bold]")
-    for evidence in finding.evidence:
+    for evidence in _default_evidence_lines(finding):
         console.print(f"- {evidence}")
     console.print()
     console.print("[bold]What to check next:[/bold]")
-    for index, item in enumerate(finding.what_to_check_next, start=1):
+    for index, item in enumerate(_default_next_steps(finding), start=1):
         console.print(f"{index}. {item}")
-
-    if finding.metadata.get("has_k8s_evidence") == "true":
-        console.print()
-        _print_collected_evidence(finding, console)
 
 
 def _print_unknown(result: ScanResult, console: Console) -> None:
@@ -96,7 +96,7 @@ def _print_unknown(result: ScanResult, console: Console) -> None:
     console.print(Panel(table, title="Last log lines", border_style="yellow"))
 
 
-def _print_success(result: ScanResult, console: Console) -> None:
+def _print_success(result: ScanResult, console: Console, *, verbose: bool) -> None:
     console.print("[bold green]Build finished successfully.[/bold green]")
     console.print("There is no failure root cause to investigate.")
 
@@ -108,8 +108,10 @@ def _print_success(result: ScanResult, console: Console) -> None:
     for step in result.successful_steps:
         console.print(f"- {step}")
 
-    console.print()
-    _print_investigation_summary(result, console)
+    _print_raw_evidence_path(result, console)
+    if verbose:
+        console.print()
+        _print_compact_summary(result, console)
 
 
 def _print_collected_evidence(finding: Finding, console: Console) -> None:
@@ -122,12 +124,12 @@ def _print_collected_evidence(finding: Finding, console: Console) -> None:
     console.print(f"- Previous logs checked: {previous_logs_checked}")
 
 
-def _print_investigation_summary(result: ScanResult, console: Console) -> None:
+def _print_compact_summary(result: ScanResult, console: Console) -> None:
     finding = result.likely_root_cause
     metadata = finding.metadata if finding is not None else {}
     evidence = result.k8s_evidence
 
-    console.print("[bold]Investigation Summary[/bold]")
+    console.print("[bold]Investigation summary[/bold]")
     console.print()
     console.print("[bold]Build:[/bold]")
     console.print(result.build_status or result.status.upper())
@@ -153,6 +155,63 @@ def _print_investigation_summary(result: ScanResult, console: Console) -> None:
     console.print("[bold]Duration:[/bold]")
     duration = result.duration_seconds if result.duration_seconds is not None else 0
     console.print(f"{duration:.1f} seconds")
+
+
+def _print_raw_evidence_path(result: ScanResult, console: Console) -> None:
+    if result.raw_evidence_dir is None:
+        return
+    console.print()
+    console.print("[bold]Raw evidence saved to:[/bold]")
+    console.print(f"{result.raw_evidence_dir}/")
+
+
+def _default_evidence_lines(finding: Finding) -> list[str]:
+    lines = []
+    timeout = finding.metadata.get("timeout")
+    for evidence in finding.evidence:
+        if evidence.startswith("Jenkins rollout command: "):
+            if timeout:
+                lines.append(f"Jenkins rollout command timed out after {timeout}")
+            else:
+                lines.append("Jenkins rollout command timed out")
+            continue
+        if _is_default_noise(evidence):
+            continue
+        lines.append(evidence)
+
+    if finding.metadata.get("has_k8s_evidence") == "true":
+        lines.append("Kubernetes deployment, pods and events were collected")
+        if len(lines) <= 2:
+            lines.append("No deeper Kubernetes cause was detected")
+
+    return list(dict.fromkeys(lines))[:5]
+
+
+def _default_next_steps(finding: Finding) -> list[str]:
+    if finding.metadata.get("has_k8s_evidence") != "true":
+        return finding.what_to_check_next[:3]
+
+    next_steps = []
+    if finding.metadata.get("events_checked") == "available":
+        next_steps.append("Open .jeffrey/events.txt")
+    if int(finding.metadata.get("pods_checked", "0")) > 0:
+        next_steps.append("Open .jeffrey/pods.txt")
+    if finding.metadata.get("previous_logs_checked") == "unavailable":
+        next_steps.append("Previous logs were not available")
+    next_steps.append("Run with --debug for detailed investigation steps")
+    return next_steps[:3]
+
+
+def _is_default_noise(evidence: str) -> bool:
+    noisy_fragments = (
+        "Kubernetes deployment description:",
+        "Kubernetes pods output:",
+        "Kubernetes events output:",
+        "Kubernetes command failed:",
+        "previous terminated container",
+        "not found",
+    )
+    return any(fragment in evidence for fragment in noisy_fragments)
 
 
 def save_markdown_report(result: ScanResult, path: Path) -> None:

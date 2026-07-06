@@ -8,7 +8,7 @@ from rich.console import Console
 
 from jeffrey.investigation import investigate_build_log, parse_rollout_command, save_raw_evidence
 from jeffrey.models import CommandResult, KubernetesEvidence
-from jeffrey.reporter import save_markdown_report
+from jeffrey.reporter import print_report, save_markdown_report
 
 ROLLOUT_COMMAND = "kubectl '--namespace=demo' rollout status deployment web-app '--timeout=150s'"
 
@@ -182,6 +182,79 @@ def test_show_commands_prints_shell_commands(tmp_path: Path, monkeypatch) -> Non
     rendered = output.getvalue()
     assert "$ kubectl get pods -n demo -l app=web-app" in rendered
     assert "$ kubectl describe deployment web-app -n demo" in rendered
+    assert "kubectl found" not in rendered
+    assert "[DEBUG]" not in rendered
+
+
+def test_default_output_hides_preflight_noise_and_previous_logs_bad_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_previous_logs_bad_request)
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Jeffrey investigation report" in rendered
+    assert "kubectl found" not in rendered
+    assert "kubeconfig loaded" not in rendered
+    assert "current context" not in rendered
+    assert "Deployment described" not in rendered
+    assert "Pod logs collected" not in rendered
+    assert "previous terminated container" not in rendered
+    assert "Error from server (BadRequest)" not in rendered
+    assert "Raw evidence saved to:" in rendered
+
+
+def test_debug_output_contains_preflight_details_and_command_errors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_previous_logs_bad_request)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    investigate_build_log(log_path, debug=True, console=console)
+
+    rendered = output.getvalue()
+    assert "kubectl found" in rendered
+    assert "current context:" in rendered
+    assert "kubectl stderr:" in rendered
+    assert "previous terminated container" in rendered
+
+
+def test_verbose_output_contains_compact_summary(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_signal("CrashLoopBackOff"))
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console, verbose=True)
+
+    rendered = output.getvalue()
+    assert "Investigation summary" in rendered
+    assert "Pods investigated:" in rendered
+    assert "Duration:" in rendered
+
+
+def test_raw_evidence_stores_command_errors(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_previous_logs_bad_request)
+
+    investigate_build_log(log_path)
+
+    previous_logs = (tmp_path / ".jeffrey" / "previous_logs.txt").read_text(encoding="utf-8")
+    assert "previous terminated container" in previous_logs
 
 
 def test_save_report_writes_markdown(tmp_path: Path, monkeypatch) -> None:
@@ -328,7 +401,9 @@ def _fake_run_with_signal(signal: str):
 
 def _completed(command: list[str], signal: str | None = None) -> subprocess.CompletedProcess:
     stdout = ""
-    if command[:4] == ["kubectl", "get", "pods", "-n"]:
+    if command == ["kubectl", "config", "current-context"]:
+        stdout = "demo-cluster\n"
+    elif command[:4] == ["kubectl", "get", "pods", "-n"]:
         stdout = "NAME READY STATUS RESTARTS AGE\nweb-app-abc-123 0/1 Running 0 2m\n"
         if signal == "ImagePullBackOff":
             stdout = (
@@ -348,3 +423,20 @@ def _completed(command: list[str], signal: str | None = None) -> subprocess.Comp
         stdout = signal or "Normal rollout event\n"
 
     return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+
+def _fake_run_with_previous_logs_bad_request(
+    command: list[str],
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    if command[:3] == ["kubectl", "logs", "web-app-abc-123"] and "--previous" in command:
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr=(
+                "Error from server (BadRequest): previous terminated container "
+                "web-app in pod web-app-abc-123 not found"
+            ),
+        )
+    return _completed(command)

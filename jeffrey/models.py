@@ -86,6 +86,7 @@ class BuildInvestigation(BaseModel):
     k8s_evidence: KubernetesEvidence | None = None
     last_lines: list[str] = Field(default_factory=list)
     duration_seconds: float | None = None
+    raw_evidence_dir: str | None = None
 
     @property
     def has_findings(self) -> bool:

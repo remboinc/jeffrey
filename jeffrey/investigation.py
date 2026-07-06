@@ -4,6 +4,7 @@ import re
 import shlex
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 
 from rich.console import Console
@@ -34,20 +35,30 @@ def investigate_build_log(
     console = console or Console()
     started_at = time.monotonic()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        task_id = progress.add_task("Investigating Jenkins build...", total=None)
+    progress_context = (
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        )
+        if debug
+        else nullcontext(None)
+    )
+
+    with progress_context as progress:
+        task_id = (
+            progress.add_task("Investigating Jenkins build...", total=None)
+            if progress is not None
+            else None
+        )
         _debug(console, debug, "Reading Jenkins log...")
         investigation = scan_build_log(path, last_lines=last_lines)
         investigation.duration_seconds = time.monotonic() - started_at
         _debug(console, debug, f"Build status: {investigation.build_status or 'UNKNOWN'}")
         if investigation.likely_root_cause and investigation.likely_root_cause.stage:
             _debug(console, debug, f"Stage: {investigation.likely_root_cause.stage}")
-        _progress(console, "Jenkins log parsed")
+        _progress(console, "Jenkins log parsed", enabled=debug)
 
         if investigation.is_success:
             investigation.duration_seconds = time.monotonic() - started_at
@@ -66,13 +77,14 @@ def investigate_build_log(
         rollout_finding.metadata.update(context)
         _debug(console, debug, f"Extracted namespace:\n{context['namespace']}")
         _debug(console, debug, f"Extracted deployment:\n{context['deployment']}")
-        _progress(console, f"Deployment detected: {context['deployment']}")
-        _progress(console, f"Namespace detected: {context['namespace']}")
+        _progress(console, f"Deployment detected: {context['deployment']}", enabled=debug)
+        _progress(console, f"Namespace detected: {context['namespace']}", enabled=debug)
         if "timeout" in context:
-            _progress(console, "Rollout timeout detected")
+            _progress(console, "Rollout timeout detected", enabled=debug)
 
-        progress.update(task_id, description="Collecting deployment evidence...")
-        _progress(console, "Collecting Kubernetes evidence...")
+        if progress is not None and task_id is not None:
+            progress.update(task_id, description="Collecting deployment evidence...")
+        _progress(console, "Collecting Kubernetes evidence...", enabled=debug)
 
         collector = collector_factory(
             timeout=kube_timeout,
@@ -83,15 +95,16 @@ def investigate_build_log(
         k8s_evidence = collector.collect(context["namespace"], context["deployment"])
         investigation.k8s_evidence = k8s_evidence
         _add_kubernetes_metadata(rollout_finding, k8s_evidence)
-        _progress_for_evidence(console, k8s_evidence)
+        _progress_for_evidence(console, k8s_evidence, enabled=debug)
 
-        progress.update(task_id, description="Correlating evidence...")
+        if progress is not None and task_id is not None:
+            progress.update(task_id, description="Correlating evidence...")
         _debug(console, debug, "Correlating evidence...")
         refine_rollout_timeout(rollout_finding, k8s_evidence)
         _debug(console, debug, "Determining root cause...")
         _debug_detected_root_cause(console, debug, rollout_finding)
-        save_raw_evidence(k8s_evidence)
-        _progress(console, "Investigation complete")
+        investigation.raw_evidence_dir = str(save_raw_evidence(k8s_evidence))
+        _progress(console, "Investigation complete", enabled=debug)
         investigation.duration_seconds = time.monotonic() - started_at
 
     return investigation
@@ -453,16 +466,22 @@ def _labeled_correlated_kubernetes_text(evidence: KubernetesEvidence) -> list[tu
     return labeled
 
 
-def _progress_for_evidence(console: Console, evidence: KubernetesEvidence) -> None:
-    _progress(console, "Deployment described")
-    _progress(console, "Pods collected")
-    _progress(console, "Events collected")
+def _progress_for_evidence(
+    console: Console,
+    evidence: KubernetesEvidence,
+    *,
+    enabled: bool,
+) -> None:
+    _progress(console, "Deployment described", enabled=enabled)
+    _progress(console, "Pods collected", enabled=enabled)
+    _progress(console, "Events collected", enabled=enabled)
     if evidence.pod_logs or evidence.pod_previous_logs:
-        _progress(console, "Pod logs collected")
+        _progress(console, "Pod logs collected", enabled=enabled)
 
 
-def _progress(console: Console, message: str) -> None:
-    console.print(f"[green]✓[/green] {message}")
+def _progress(console: Console, message: str, *, enabled: bool) -> None:
+    if enabled:
+        console.print(f"[green]✓[/green] {message}")
 
 
 def _debug(console: Console, enabled: bool, message: str) -> None:

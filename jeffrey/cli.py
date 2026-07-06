@@ -78,6 +78,13 @@ def scan(
             help="Print every investigation step.",
         ),
     ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            help="Print the report plus a compact investigation summary.",
+        ),
+    ] = False,
     save_report: Annotated[
         Path | None,
         typer.Option(
@@ -100,7 +107,7 @@ def scan(
         debug=debug,
         console=console,
     )
-    print_report(result, console=console, show_all=show_all)
+    print_report(result, console=console, show_all=show_all, verbose=verbose)
     if save_report is not None:
         save_markdown_report(result, save_report)
         console.print(f"[green]✓[/green] Markdown report saved: {save_report}")
