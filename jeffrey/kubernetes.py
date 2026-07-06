@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from collections.abc import Callable
@@ -71,46 +72,103 @@ class KubernetesCollector:
             self._record_error(evidence, result)
 
         self.debug_fn("Collecting deployment evidence...")
+        evidence.deployment_json = self._run(
+            ["kubectl", "get", "deployment", deployment, "-n", namespace, "-o", "json"]
+        )
+        evidence.executed_commands.append(evidence.deployment_json)
+        self._record_error(evidence, evidence.deployment_json)
+        evidence.selector = selector_from_deployment_json(evidence.deployment_json)
+        evidence.selector_text = selector_to_text(evidence.selector)
+        if evidence.selector_text:
+            self.debug_fn(f"Deployment selector:\n{evidence.selector_text}")
+
         evidence.deployment_description = self._run(
             ["kubectl", "describe", "deployment", deployment, "-n", namespace]
         )
         evidence.executed_commands.append(evidence.deployment_description)
         self._record_error(evidence, evidence.deployment_description)
+        evidence.replica_sets = replica_sets_from_deployment_describe(
+            evidence.deployment_description
+        )
 
         self.debug_fn("Collecting pod evidence...")
-        evidence.labeled_pods_output = self._run(
-            ["kubectl", "get", "pods", "-n", namespace, "-l", f"app={deployment}"]
-        )
-        evidence.executed_commands.append(evidence.labeled_pods_output)
-        self._record_error(evidence, evidence.labeled_pods_output)
-
-        selected_pods = identify_related_pods(evidence.labeled_pods_output, deployment)
-        if not selected_pods:
-            evidence.pods_output = self._run(["kubectl", "get", "pods", "-n", namespace])
-            evidence.executed_commands.append(evidence.pods_output)
-            self._record_error(evidence, evidence.pods_output)
-            selected_pods = identify_related_pods(evidence.pods_output, deployment)
+        selected_pods: list[str] = []
+        if evidence.selector_text:
+            evidence.labeled_pods_output = self._run(
+                [
+                    "kubectl",
+                    "get",
+                    "pods",
+                    "-n",
+                    namespace,
+                    "-l",
+                    evidence.selector_text,
+                    "-o",
+                    "json",
+                ]
+            )
+            evidence.pods_json = evidence.labeled_pods_output
+            evidence.executed_commands.append(evidence.labeled_pods_output)
+            self._record_error(evidence, evidence.labeled_pods_output)
+            selected_pods = pod_names_from_pods_json(evidence.labeled_pods_output)
+            evidence.selector_lookup_failed = not selected_pods
         else:
-            evidence.pods_output = evidence.labeled_pods_output
+            evidence.selector_lookup_failed = True
 
-        evidence.selected_pods = selected_pods
-        if selected_pods:
-            self.debug_fn("Found pods:\n" + "\n".join(selected_pods))
+        if not selected_pods:
+            evidence.fallback_pod_matching_used = True
+            evidence.pods_json = self._run(
+                ["kubectl", "get", "pods", "-n", namespace, "-o", "json"]
+            )
+            evidence.executed_commands.append(evidence.pods_json)
+            self._record_error(evidence, evidence.pods_json)
+            selected_pods = identify_related_pods_from_json(evidence.pods_json, deployment)
 
-        self.debug_fn("Collecting event evidence...")
-        evidence.events_output = self._run(
+        evidence.pods_output = self._run(["kubectl", "get", "pods", "-n", namespace])
+        evidence.executed_commands.append(evidence.pods_output)
+        self._record_error(evidence, evidence.pods_output)
+
+        if evidence.fallback_pod_matching_used and not selected_pods:
+            selected_pods = identify_related_pods(evidence.pods_output, deployment)
+
+        if evidence.labeled_pods_output is None and evidence.pods_json is not None:
+            evidence.labeled_pods_output = evidence.pods_json
+
+        evidence.selected_pods = selected_pods[:MAX_PODS_TO_COLLECT]
+        if evidence.selected_pods:
+            self.debug_fn("Found pods:\n" + "\n".join(evidence.selected_pods))
+
+        self.debug_fn("Collecting namespace event context...")
+        evidence.namespace_events_output = self._run(
             ["kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp"]
         )
-        evidence.executed_commands.append(evidence.events_output)
-        self._record_error(evidence, evidence.events_output)
+        evidence.events_output = evidence.namespace_events_output
+        evidence.executed_commands.append(evidence.namespace_events_output)
+        self._record_error(evidence, evidence.namespace_events_output)
+        evidence.unrelated_namespace_events_ignored = count_unrelated_namespace_events(evidence)
 
         self.debug_fn("Collecting container logs...")
-        for pod_name in selected_pods:
+        for pod_name in evidence.selected_pods:
             self.debug_fn(f"Selected pod:\n{pod_name}")
             describe_result = self._run(["kubectl", "describe", "pod", pod_name, "-n", namespace])
             evidence.pod_descriptions[pod_name] = describe_result
             evidence.executed_commands.append(describe_result)
             self._record_error(evidence, describe_result)
+
+            pod_events_result = self._run(
+                [
+                    "kubectl",
+                    "get",
+                    "events",
+                    "-n",
+                    namespace,
+                    f"--field-selector=involvedObject.name={pod_name}",
+                    "--sort-by=.lastTimestamp",
+                ]
+            )
+            evidence.pod_events[pod_name] = pod_events_result
+            evidence.executed_commands.append(pod_events_result)
+            self._record_error(evidence, pod_events_result)
 
             logs_result = self._run(
                 ["kubectl", "logs", pod_name, "-n", namespace, "--tail=200"]
@@ -126,6 +184,10 @@ class KubernetesCollector:
             evidence.executed_commands.append(previous_logs_result)
             self._record_error(evidence, previous_logs_result)
 
+        evidence.correlated_events_found = sum(
+            len(correlated_lines_from_command(result))
+            for result in evidence.pod_events.values()
+        )
         return evidence
 
     def verify_environment(self) -> EnvironmentCheck:
@@ -213,6 +275,149 @@ def identify_related_pods(
             candidates.append((_pod_status_rank(status), len(candidates), pod_name))
 
     return [pod_name for _, _, pod_name in sorted(candidates)[:limit]]
+
+
+def selector_from_deployment_json(result: CommandResult | None) -> dict[str, str]:
+    if result is None or not result.stdout:
+        return {}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+    match_labels = (
+        payload.get("spec", {})
+        .get("selector", {})
+        .get("matchLabels", {})
+    )
+    if not isinstance(match_labels, dict):
+        return {}
+    return {str(key): str(value) for key, value in match_labels.items()}
+
+
+def selector_to_text(selector: dict[str, str]) -> str | None:
+    if not selector:
+        return None
+    return ",".join(f"{key}={value}" for key, value in sorted(selector.items()))
+
+
+def pod_names_from_pods_json(
+    result: CommandResult | None,
+    *,
+    limit: int = MAX_PODS_TO_COLLECT,
+) -> list[str]:
+    if result is None or not result.stdout:
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    candidates = []
+    for index, item in enumerate(payload.get("items", [])):
+        pod_name = item.get("metadata", {}).get("name")
+        status = item.get("status", {}).get("phase", "")
+        waiting_reason = _waiting_reason_from_pod_item(item)
+        rank_status = waiting_reason or status
+        if not pod_name or rank_status == "Completed" or status == "Succeeded":
+            continue
+        candidates.append((_pod_status_rank(rank_status), index, str(pod_name)))
+
+    return [pod_name for _, _, pod_name in sorted(candidates)[:limit]]
+
+
+def identify_related_pods_from_json(
+    result: CommandResult | None,
+    deployment: str,
+    *,
+    limit: int = MAX_PODS_TO_COLLECT,
+) -> list[str]:
+    if result is None or not result.stdout:
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    candidates = []
+    for index, item in enumerate(payload.get("items", [])):
+        pod_name = item.get("metadata", {}).get("name")
+        if not pod_name:
+            continue
+        status = item.get("status", {}).get("phase", "")
+        waiting_reason = _waiting_reason_from_pod_item(item)
+        rank_status = waiting_reason or status
+        if rank_status == "Completed" or status == "Succeeded":
+            continue
+        if pod_name.startswith(f"{deployment}-") or deployment in pod_name:
+            candidates.append((_pod_status_rank(rank_status), index, str(pod_name)))
+
+    return [pod_name for _, _, pod_name in sorted(candidates)[:limit]]
+
+
+def replica_sets_from_deployment_describe(result: CommandResult | None) -> list[str]:
+    if result is None:
+        return []
+
+    replica_sets = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("NewReplicaSet:"):
+            value = stripped.removeprefix("NewReplicaSet:").strip()
+            if value and value != "<none>":
+                replica_sets.append(value.split()[0])
+        elif stripped.startswith("OldReplicaSets:"):
+            value = stripped.removeprefix("OldReplicaSets:").strip()
+            if value and value != "<none>":
+                replica_sets.extend(part.strip(",") for part in value.split() if part != "<none>")
+    return list(dict.fromkeys(replica_sets))
+
+
+def count_unrelated_namespace_events(evidence: KubernetesEvidence) -> int:
+    if evidence.namespace_events_output is None:
+        return 0
+
+    unrelated = 0
+    for line in evidence.namespace_events_output.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("last seen"):
+            continue
+        if not event_line_is_correlated(stripped, evidence):
+            unrelated += 1
+    return unrelated
+
+
+def event_line_is_correlated(line: str, evidence: KubernetesEvidence) -> bool:
+    if evidence.deployment in line:
+        return True
+    if any(pod_name in line for pod_name in evidence.selected_pods):
+        return True
+    return any(replica_set in line for replica_set in evidence.replica_sets)
+
+
+def correlated_lines_from_command(result: CommandResult | None) -> list[str]:
+    if result is None:
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _waiting_reason_from_pod_item(item: dict[str, object]) -> str | None:
+    container_statuses = item.get("status", {}).get("containerStatuses", [])
+    if not isinstance(container_statuses, list):
+        return None
+    for status in container_statuses:
+        if not isinstance(status, dict):
+            continue
+        state = status.get("state", {})
+        if not isinstance(state, dict):
+            continue
+        waiting = state.get("waiting", {})
+        if isinstance(waiting, dict) and waiting.get("reason"):
+            return str(waiting["reason"])
+        terminated = state.get("terminated", {})
+        if isinstance(terminated, dict) and terminated.get("reason"):
+            return str(terminated["reason"])
+    return None
 
 
 def _pod_status_rank(status: str) -> int:

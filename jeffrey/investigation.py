@@ -114,12 +114,26 @@ def save_raw_evidence(evidence: KubernetesEvidence, directory: Path | None = Non
     output_dir = directory or Path(".jeffrey")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    _write_result(output_dir / "deployment.txt", evidence.deployment_description)
+    _write_result(output_dir / "deployment.json", evidence.deployment_json)
+    _write_result(output_dir / "deployment_describe.txt", evidence.deployment_description)
+    _write_result(output_dir / "pods.json", evidence.pods_json)
     _write_result(output_dir / "pods.txt", evidence.pods_output)
-    _write_result(output_dir / "events.txt", evidence.events_output)
+    _write_namespace_events(output_dir / "namespace_events.txt", evidence.namespace_events_output)
     _write_many(output_dir / "pod_describe.txt", evidence.pod_descriptions)
     _write_many(output_dir / "logs.txt", evidence.pod_logs)
     _write_many(output_dir / "previous_logs.txt", evidence.pod_previous_logs)
+    for pod_name, result in evidence.pod_descriptions.items():
+        safe_name = _safe_filename(pod_name)
+        _write_result(output_dir / f"pod_{safe_name}_describe.txt", result)
+    for pod_name, result in evidence.pod_events.items():
+        safe_name = _safe_filename(pod_name)
+        _write_result(output_dir / f"pod_{safe_name}_events.txt", result)
+    for pod_name, result in evidence.pod_logs.items():
+        safe_name = _safe_filename(pod_name)
+        _write_result(output_dir / f"pod_{safe_name}_logs.txt", result)
+    for pod_name, result in evidence.pod_previous_logs.items():
+        safe_name = _safe_filename(pod_name)
+        _write_result(output_dir / f"pod_{safe_name}_previous_logs.txt", result)
     (output_dir / "commands.txt").write_text(
         "\n".join(result.command_text for result in evidence.executed_commands),
         encoding="utf-8",
@@ -282,11 +296,17 @@ def _add_kubernetes_metadata(finding: Finding, evidence: KubernetesEvidence) -> 
             "has_k8s_evidence": "true",
             "namespace": evidence.namespace,
             "deployment": evidence.deployment,
+            "selector": evidence.selector_text or "unavailable",
+            "fallback_pod_matching_used": str(evidence.fallback_pod_matching_used).lower(),
             "deployment_description": _availability(evidence.deployment_description),
             "pods_checked": str(evidence.pods_checked),
-            "events_checked": _availability(evidence.events_output),
+            "events_checked": _availability(evidence.namespace_events_output),
             "previous_logs_checked": _previous_logs_availability(evidence),
             "executed_commands": str(len(evidence.executed_commands)),
+            "correlated_events_found": str(evidence.correlated_events_found),
+            "unrelated_namespace_events_ignored": str(
+                evidence.unrelated_namespace_events_ignored
+            ),
         }
     )
 
@@ -341,6 +361,9 @@ def _correlated_kubernetes_text_blocks(evidence: KubernetesEvidence) -> list[str
         blocks.extend(_related_pod_lines(evidence))
     if evidence.events_output is not None:
         blocks.extend(_related_event_lines(evidence))
+    for pod_name, result in evidence.pod_events.items():
+        blocks.extend(_pod_specific_event_lines(pod_name, result))
+        blocks.append(result.stderr)
     for result in (
         *evidence.pod_descriptions.values(),
         *evidence.pod_logs.values(),
@@ -381,7 +404,7 @@ def _related_pod_lines(evidence: KubernetesEvidence) -> list[str]:
 
 
 def _related_event_lines(evidence: KubernetesEvidence) -> list[str]:
-    if evidence.events_output is None:
+    if evidence.namespace_events_output is None:
         return []
 
     lines = []
@@ -392,12 +415,23 @@ def _related_event_lines(evidence: KubernetesEvidence) -> list[str]:
         f"deployment.apps/{evidence.deployment}",
     }
 
-    for line in evidence.events_output.stdout.splitlines():
+    for line in evidence.namespace_events_output.stdout.splitlines():
         if _line_mentions_selected_pod(line, selected_pods) or any(
             marker in line for marker in deployment_markers
-        ):
+        ) or any(replica_set in line for replica_set in evidence.replica_sets):
             lines.append(line)
     return lines
+
+
+def _pod_specific_event_lines(pod_name: str, result: object | None) -> list[str]:
+    if result is None:
+        return []
+    stdout = getattr(result, "stdout", "")
+    return [
+        line
+        for line in stdout.splitlines()
+        if line.strip() and (f"pod/{pod_name}" in line or pod_name in line)
+    ]
 
 
 def _line_mentions_selected_pod(line: str, selected_pods: set[str]) -> bool:
@@ -414,7 +448,12 @@ def _important_kubernetes_summary(evidence: KubernetesEvidence) -> list[str]:
         lines.append(f"Kubernetes pods output: {status}")
     if evidence.events_output is not None:
         status = "available" if evidence.events_output.succeeded else "unavailable"
-        lines.append(f"Kubernetes events output: {status}")
+        lines.append(f"Kubernetes namespace events output: {status}")
+    if evidence.selected_pods:
+        lines.append(
+            "Kubernetes evidence was collected, but no correlated pod/deployment "
+            "failure was found."
+        )
     for error in evidence.command_errors[:3]:
         reason = _compact_error(error.stderr)
         lines.append(f"Kubernetes command failed: {error.command_text}: {reason}")
@@ -454,6 +493,12 @@ def _labeled_correlated_kubernetes_text(evidence: KubernetesEvidence) -> list[tu
     if evidence.events_output is not None:
         labeled.append(("Kubernetes", "\n".join(_related_event_lines(evidence))))
         labeled.append(("Kubernetes", evidence.events_output.stderr))
+    for pod_name, result in evidence.pod_events.items():
+        pod_event_lines = "\n".join(_pod_specific_event_lines(pod_name, result))
+        labeled.append(
+            (f"Kubernetes pod events {pod_name}", pod_event_lines)
+        )
+        labeled.append((f"Kubernetes pod events {pod_name}", result.stderr))
     for pod_name, result in evidence.pod_descriptions.items():
         labeled.append((f"Kubernetes pod {pod_name}", result.stdout))
         labeled.append((f"Kubernetes pod {pod_name}", result.stderr))
@@ -533,3 +578,21 @@ def _join_output(stdout: str, stderr: str) -> str:
     if stderr:
         parts.append(stderr)
     return "\n".join(parts)
+
+
+def _write_namespace_events(path: Path, result: object | None) -> None:
+    header = (
+        "Uncorrelated raw namespace event context. These events are saved for manual "
+        "debugging and are not used as primary report evidence unless they mention "
+        "the investigated deployment, selected pods, or selected ReplicaSets.\n\n"
+    )
+    if result is None:
+        path.write_text(header, encoding="utf-8")
+        return
+    stdout = getattr(result, "stdout", "")
+    stderr = getattr(result, "stderr", "")
+    path.write_text(header + _join_output(stdout, stderr), encoding="utf-8")
+
+
+def _safe_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)

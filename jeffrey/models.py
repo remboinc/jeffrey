@@ -58,16 +58,27 @@ class KubernetesEvidence(BaseModel):
     namespace: str
     deployment: str
     environment: EnvironmentCheck | None = None
+    deployment_json: CommandResult | None = None
     deployment_description: CommandResult | None = None
+    selector: dict[str, str] = Field(default_factory=dict)
+    selector_text: str | None = None
+    selector_lookup_failed: bool = False
+    fallback_pod_matching_used: bool = False
+    replica_sets: list[str] = Field(default_factory=list)
     labeled_pods_output: CommandResult | None = None
+    pods_json: CommandResult | None = None
     pods_output: CommandResult | None = None
+    namespace_events_output: CommandResult | None = None
     events_output: CommandResult | None = None
     selected_pods: list[str] = Field(default_factory=list)
     pod_descriptions: dict[str, CommandResult] = Field(default_factory=dict)
+    pod_events: dict[str, CommandResult] = Field(default_factory=dict)
     pod_logs: dict[str, CommandResult] = Field(default_factory=dict)
     pod_previous_logs: dict[str, CommandResult] = Field(default_factory=dict)
     command_errors: list[CommandResult] = Field(default_factory=list)
     executed_commands: list[CommandResult] = Field(default_factory=list)
+    correlated_events_found: int = 0
+    unrelated_namespace_events_ignored: int = 0
 
     @property
     def pods_checked(self) -> int:

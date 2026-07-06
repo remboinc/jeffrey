@@ -64,15 +64,17 @@ Jeffrey extracts:
 - deployment: `web-app`
 - timeout: `150s`
 
-Then it runs:
+Then it runs deployment-scoped collection:
 
 ```bash
+kubectl get deployment web-app -n demo -o json
 kubectl describe deployment web-app -n demo
-kubectl get pods -n demo
-kubectl get events -n demo --sort-by=.lastTimestamp
+kubectl get pods -n demo -l app=web-app -o json
 ```
 
-If related pods are found, Jeffrey also collects pod descriptions and current/previous logs for up to 3 pods.
+Jeffrey uses the deployment selector from JSON to find pods. If related pods are found,
+Jeffrey collects pod descriptions, pod-specific events, and current/previous logs for up to
+3 pods.
 
 Jeffrey first tries pod discovery with:
 
@@ -80,7 +82,7 @@ Jeffrey first tries pod discovery with:
 kubectl get pods -n demo -l app=web-app
 ```
 
-If no pods are found, it falls back to:
+If selector lookup fails, it falls back to name matching and marks that fallback in the report.
 
 ```bash
 kubectl get pods -n demo
@@ -129,12 +131,15 @@ jeffrey scan --build-log ./jenkins.log --save-report report.md
 
 Raw evidence is saved automatically in `.jeffrey/`:
 
-- `deployment.txt`
+- `deployment.json`
+- `deployment_describe.txt`
+- `pods.json`
 - `pods.txt`
-- `events.txt`
-- `pod_describe.txt`
-- `logs.txt`
-- `previous_logs.txt`
+- `pod_<pod_name>_describe.txt`
+- `pod_<pod_name>_events.txt`
+- `pod_<pod_name>_logs.txt`
+- `pod_<pod_name>_previous_logs.txt`
+- `namespace_events.txt` as uncorrelated raw context
 - `commands.txt`
 
 ## Supported Patterns

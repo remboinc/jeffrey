@@ -151,6 +151,138 @@ def test_foreign_namespace_events_do_not_refine_root_cause(tmp_path: Path, monke
     assert result.likely_root_cause.root_cause == "Deployment rollout timed out"
     assert all("database-0" not in line for line in result.likely_root_cause.evidence)
     assert all("other-api-123" not in line for line in result.likely_root_cause.evidence)
+    namespace_events = (tmp_path / ".jeffrey" / "namespace_events.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "database-0" in namespace_events
+    assert "other-api-123" in namespace_events
+    assert "Uncorrelated raw namespace event context" in namespace_events
+
+
+def test_pod_specific_events_for_selected_pod_are_included(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        if (
+            command[:3] == ["kubectl", "get", "events"]
+            and any("involvedObject.name=web-app-abc-123" in part for part in command)
+        ):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="4m Warning Unhealthy pod/web-app-abc-123 Readiness probe failed\n",
+                stderr="",
+            )
+        if command[:3] == ["kubectl", "get", "events"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    "57m Warning Unhealthy pod/database-0 Readiness probe failed\n"
+                    "4m Warning Unhealthy pod/other-api-123 Readiness probe failed\n"
+                ),
+                stderr="",
+            )
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.likely_root_cause is not None
+    assert result.likely_root_cause.root_cause == (
+        "Deployment rollout timed out because new pods did not pass readiness checks."
+    )
+    assert any("web-app-abc-123" in line for line in result.likely_root_cause.evidence)
+    assert all("database-0" not in line for line in result.likely_root_cause.evidence)
+    assert all("other-api-123" not in line for line in result.likely_root_cause.evidence)
+
+
+def test_selector_from_deployment_json_is_used_for_pod_lookup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.k8s_evidence is not None
+    assert result.k8s_evidence.selector == {"app": "web-app"}
+    assert result.k8s_evidence.fallback_pod_matching_used is False
+    assert [
+        "kubectl",
+        "get",
+        "pods",
+        "-n",
+        "demo",
+        "-l",
+        "app=web-app",
+        "-o",
+        "json",
+    ] in commands
+
+
+def test_fallback_name_matching_is_used_only_when_selector_lookup_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        if (
+            command[:4] == ["kubectl", "get", "pods", "-n"]
+            and "-l" in command
+            and "-o" in command
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout='{"items":[]}', stderr="")
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.k8s_evidence is not None
+    assert result.k8s_evidence.fallback_pod_matching_used is True
+    assert result.k8s_evidence.selected_pods == ["web-app-abc-123"]
+
+
+def test_default_output_says_no_correlated_failure_for_unrelated_events(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        if command[:3] == ["kubectl", "get", "events"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="4m Warning Unhealthy pod/other-api-123 Readiness probe failed\n",
+                stderr="",
+            )
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Kubernetes evidence was collected, but no correlated pod failure was found" in rendered
+    assert "other-api-123" not in rendered
 
 
 def test_debug_output_shows_investigation_steps(tmp_path: Path, monkeypatch) -> None:
@@ -180,7 +312,7 @@ def test_show_commands_prints_shell_commands(tmp_path: Path, monkeypatch) -> Non
     investigate_build_log(log_path, show_commands=True, console=console)
 
     rendered = output.getvalue()
-    assert "$ kubectl get pods -n demo -l app=web-app" in rendered
+    assert "$ kubectl get pods -n demo -l app=web-app -o json" in rendered
     assert "$ kubectl describe deployment web-app -n demo" in rendered
     assert "kubectl found" not in rendered
     assert "[DEBUG]" not in rendered
@@ -281,12 +413,22 @@ def test_save_raw_evidence_writes_files(tmp_path: Path) -> None:
             exit_code=0,
             stdout="deployment details",
         ),
+        deployment_json=CommandResult(
+            command=["kubectl", "get", "deployment", "web-app", "-o", "json"],
+            exit_code=0,
+            stdout='{"spec": {"selector": {"matchLabels": {"app": "web-app"}}}}',
+        ),
+        pods_json=CommandResult(
+            command=["kubectl", "get", "pods", "-o", "json"],
+            exit_code=0,
+            stdout='{"items": []}',
+        ),
         pods_output=CommandResult(
             command=["kubectl", "get", "pods"],
             exit_code=0,
             stdout="pods",
         ),
-        events_output=CommandResult(
+        namespace_events_output=CommandResult(
             command=["kubectl", "get", "events"],
             exit_code=0,
             stdout="events",
@@ -316,10 +458,17 @@ def test_save_raw_evidence_writes_files(tmp_path: Path) -> None:
 
     output_dir = save_raw_evidence(evidence, tmp_path / ".jeffrey")
 
-    assert (output_dir / "deployment.txt").read_text(encoding="utf-8") == "deployment details"
+    assert (output_dir / "deployment.json").read_text(encoding="utf-8")
+    assert (
+        output_dir / "deployment_describe.txt"
+    ).read_text(encoding="utf-8") == "deployment details"
+    assert (output_dir / "pods.json").read_text(encoding="utf-8")
     assert (output_dir / "pods.txt").read_text(encoding="utf-8") == "pods"
-    assert (output_dir / "events.txt").read_text(encoding="utf-8") == "events"
+    assert "events" in (output_dir / "namespace_events.txt").read_text(encoding="utf-8")
     assert "pod describe" in (output_dir / "pod_describe.txt").read_text(encoding="utf-8")
+    assert (
+        output_dir / "pod_web-app-abc-123_describe.txt"
+    ).read_text(encoding="utf-8") == "pod describe"
     assert "logs" in (output_dir / "logs.txt").read_text(encoding="utf-8")
     assert "previous logs" in (output_dir / "previous_logs.txt").read_text(encoding="utf-8")
 
@@ -352,7 +501,7 @@ def test_partial_kubectl_failures_do_not_stop_investigation(tmp_path: Path, monk
 
     assert result.k8s_evidence is not None
     assert result.k8s_evidence.pod_descriptions
-    assert result.k8s_evidence.events_output is not None
+    assert result.k8s_evidence.namespace_events_output is not None
     assert result.k8s_evidence.command_errors
 
 
@@ -403,6 +552,24 @@ def _completed(command: list[str], signal: str | None = None) -> subprocess.Comp
     stdout = ""
     if command == ["kubectl", "config", "current-context"]:
         stdout = "demo-cluster\n"
+    elif command[:5] == ["kubectl", "get", "deployment", "web-app", "-n"]:
+        stdout = '{"spec": {"selector": {"matchLabels": {"app": "web-app"}}}}\n'
+    elif (
+        command[:4] == ["kubectl", "get", "pods", "-n"]
+        and "-o" in command
+        and "json" in command
+    ):
+        reason = ""
+        if signal in {"CrashLoopBackOff", "ImagePullBackOff"}:
+            reason = (
+                ',"containerStatuses":[{"state":{"waiting":{"reason":"'
+                f'{signal}"'
+                "}}}]"
+            )
+        stdout = (
+            '{"items":[{"metadata":{"name":"web-app-abc-123"},'
+            f'"status":{{"phase":"Running"{reason}}}}}]}}\n'
+        )
     elif command[:4] == ["kubectl", "get", "pods", "-n"]:
         stdout = "NAME READY STATUS RESTARTS AGE\nweb-app-abc-123 0/1 Running 0 2m\n"
         if signal == "ImagePullBackOff":
@@ -419,6 +586,11 @@ def _completed(command: list[str], signal: str | None = None) -> subprocess.Comp
             stdout = signal or ""
     elif command[:4] == ["kubectl", "describe", "deployment", "web-app"]:
         stdout = "Deployment web-app description\n"
+    elif (
+        command[:3] == ["kubectl", "get", "events"]
+        and any("involvedObject.name=web-app-abc-123" in part for part in command)
+    ):
+        stdout = signal or "Normal pod event\n"
     elif command[:3] == ["kubectl", "get", "events"]:
         stdout = signal or "Normal rollout event\n"
 

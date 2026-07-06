@@ -146,8 +146,17 @@ def _print_compact_summary(result: ScanResult, console: Console) -> None:
     console.print("[bold]Pods investigated:[/bold]")
     console.print(str(evidence.pods_checked if evidence is not None else 0))
     console.print()
+    console.print("[bold]Selector:[/bold]")
+    console.print(metadata.get("selector") or "Unknown")
+    console.print()
+    console.print("[bold]Correlated events found:[/bold]")
+    console.print(metadata.get("correlated_events_found", "0"))
+    console.print()
+    console.print("[bold]Unrelated namespace events ignored:[/bold]")
+    console.print(metadata.get("unrelated_namespace_events_ignored", "0"))
+    console.print()
     console.print("[bold]Events collected:[/bold]")
-    console.print(_yes_no(evidence is not None and evidence.events_output is not None))
+    console.print(_yes_no(evidence is not None and evidence.namespace_events_output is not None))
     console.print()
     console.print("[bold]Previous logs:[/bold]")
     console.print(_yes_no(evidence is not None and evidence.previous_logs_checked))
@@ -180,7 +189,17 @@ def _default_evidence_lines(finding: Finding) -> list[str]:
         lines.append(evidence)
 
     if finding.metadata.get("has_k8s_evidence") == "true":
-        lines.append("Kubernetes deployment, pods and events were collected")
+        deployment = finding.metadata.get("deployment", "deployment")
+        if _has_correlated_failure_evidence(lines):
+            lines.append(
+                f"Correlated Kubernetes evidence was collected for deployment {deployment}"
+            )
+        else:
+            lines.append(
+                "Kubernetes evidence was collected, but no correlated pod failure was found"
+            )
+        if finding.metadata.get("fallback_pod_matching_used") == "true":
+            lines.append("Pod selector lookup failed; fallback pod name matching was used")
         if len(lines) <= 2:
             lines.append("No deeper Kubernetes cause was detected")
 
@@ -193,13 +212,29 @@ def _default_next_steps(finding: Finding) -> list[str]:
 
     next_steps = []
     if finding.metadata.get("events_checked") == "available":
-        next_steps.append("Open .jeffrey/events.txt")
+        next_steps.append("Open .jeffrey/namespace_events.txt")
     if int(finding.metadata.get("pods_checked", "0")) > 0:
         next_steps.append("Open .jeffrey/pods.txt")
     if finding.metadata.get("previous_logs_checked") == "unavailable":
         next_steps.append("Previous logs were not available")
     next_steps.append("Run with --debug for detailed investigation steps")
     return next_steps[:3]
+
+
+def _has_correlated_failure_evidence(lines: list[str]) -> bool:
+    markers = (
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "OOMKilled",
+        "CreateContainerConfigError",
+        "Readiness probe failed",
+        "Liveness probe failed",
+        "ModuleNotFoundError",
+        "permission denied",
+        "connection refused",
+    )
+    return any(any(marker in line for marker in markers) for line in lines)
 
 
 def _is_default_noise(evidence: str) -> bool:
