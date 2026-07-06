@@ -29,6 +29,29 @@ class SuccessfulRollout(BaseModel):
     evidence: str
 
 
+class JenkinsRolloutContext(BaseModel):
+    namespace: str
+    deployment: str
+    timeout: str | None = None
+    command: str
+
+    def __getitem__(self, key: str) -> str:
+        value = getattr(self, key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def to_metadata(self) -> dict[str, str]:
+        metadata = {
+            "namespace": self.namespace,
+            "deployment": self.deployment,
+            "jenkins_rollout_command": self.command,
+        }
+        if self.timeout is not None:
+            metadata["timeout"] = self.timeout
+        return metadata
+
+
 class CommandResult(BaseModel):
     command: list[str]
     exit_code: int | None = None
@@ -94,6 +117,7 @@ class BuildInvestigation(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     build_status: str | None = None
     successful_rollouts: list[SuccessfulRollout] = Field(default_factory=list)
+    rollout_context: JenkinsRolloutContext | None = None
     k8s_evidence: KubernetesEvidence | None = None
     last_lines: list[str] = Field(default_factory=list)
     duration_seconds: float | None = None

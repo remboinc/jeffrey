@@ -76,7 +76,7 @@ Jeffrey uses the deployment selector from JSON to find pods. If related pods are
 Jeffrey collects pod descriptions, pod-specific events, and current/previous logs for up to
 3 pods.
 
-Jeffrey first tries pod discovery with:
+For example, if the deployment selector is `app=web-app`, Jeffrey runs:
 
 ```bash
 kubectl get pods -n demo -l app=web-app
@@ -177,7 +177,7 @@ Jeffrey detects Jenkins stages from log lines like:
 - Does not connect to Jenkins.
 - Kubernetes investigation requires `kubectl` and a working kubeconfig.
 - If Kubernetes is unavailable, Jeffrey still reports the Jenkins-level diagnosis.
-- Pod matching first tries `app=<deployment>`, then falls back to prefix/contains matching.
+- Pod matching uses the deployment selector from Kubernetes JSON, then falls back to prefix/contains matching only if selector lookup fails.
 - Kubernetes log collection is limited to 3 matching pods.
 - Kubernetes command timeout defaults to 15 seconds.
 - Root-cause explanations are based on known log patterns and may need human verification.

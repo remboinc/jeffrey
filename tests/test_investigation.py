@@ -45,6 +45,27 @@ def test_automatically_attempts_kubernetes_investigation_when_rollout_timeout_de
     assert ["kubectl", "describe", "deployment", "web-app", "-n", "demo"] in commands
 
 
+def test_jenkins_rollout_values_are_stored_and_reused(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.rollout_context is not None
+    assert result.rollout_context.namespace == "demo"
+    assert result.rollout_context.deployment == "web-app"
+    assert result.rollout_context.timeout == "150s"
+    assert result.rollout_context.command == ROLLOUT_COMMAND
+    assert ["kubectl", "get", "deployment", "web-app", "-n", "demo", "-o", "json"] in commands
+
+
 def test_does_not_attempt_kubernetes_investigation_for_successful_build(
     tmp_path: Path,
     monkeypatch,

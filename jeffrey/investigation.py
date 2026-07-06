@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from jeffrey.kubernetes import DEFAULT_KUBE_TIMEOUT, KubernetesCollector
-from jeffrey.models import BuildInvestigation, Finding, KubernetesEvidence
+from jeffrey.models import BuildInvestigation, Finding, JenkinsRolloutContext, KubernetesEvidence
 from jeffrey.scanner import scan_build_log
 
 ROLLOUT_CONTEXT_PATTERN = re.compile(
@@ -74,12 +74,13 @@ def investigate_build_log(
             investigation.duration_seconds = time.monotonic() - started_at
             return investigation
 
-        rollout_finding.metadata.update(context)
-        _debug(console, debug, f"Extracted namespace:\n{context['namespace']}")
-        _debug(console, debug, f"Extracted deployment:\n{context['deployment']}")
-        _progress(console, f"Deployment detected: {context['deployment']}", enabled=debug)
-        _progress(console, f"Namespace detected: {context['namespace']}", enabled=debug)
-        if "timeout" in context:
+        investigation.rollout_context = context
+        rollout_finding.metadata.update(context.to_metadata())
+        _debug(console, debug, f"Extracted namespace:\n{context.namespace}")
+        _debug(console, debug, f"Extracted deployment:\n{context.deployment}")
+        _progress(console, f"Deployment detected: {context.deployment}", enabled=debug)
+        _progress(console, f"Namespace detected: {context.namespace}", enabled=debug)
+        if context.timeout is not None:
             _progress(console, "Rollout timeout detected", enabled=debug)
 
         if progress is not None and task_id is not None:
@@ -92,7 +93,7 @@ def investigate_build_log(
             debug=debug,
             console=console,
         )
-        k8s_evidence = collector.collect(context["namespace"], context["deployment"])
+        k8s_evidence = collector.collect(context.namespace, context.deployment)
         investigation.k8s_evidence = k8s_evidence
         _add_kubernetes_metadata(rollout_finding, k8s_evidence)
         _progress_for_evidence(console, k8s_evidence, enabled=debug)
@@ -141,7 +142,7 @@ def save_raw_evidence(evidence: KubernetesEvidence, directory: Path | None = Non
     return output_dir
 
 
-def rollout_context_from_finding(finding: Finding) -> dict[str, str] | None:
+def rollout_context_from_finding(finding: Finding) -> JenkinsRolloutContext | None:
     for evidence in finding.evidence:
         if evidence.startswith("Jenkins rollout command: "):
             command = evidence.removeprefix("Jenkins rollout command: ")
@@ -157,7 +158,7 @@ def rollout_context_from_finding(finding: Finding) -> dict[str, str] | None:
     return None
 
 
-def parse_rollout_command(command: str) -> dict[str, str] | None:
+def parse_rollout_command(command: str) -> JenkinsRolloutContext | None:
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -187,10 +188,12 @@ def parse_rollout_command(command: str) -> dict[str, str] | None:
     if namespace is None or deployment is None:
         return _parse_rollout_command_with_regex(command)
 
-    context = {"namespace": namespace, "deployment": deployment}
-    if timeout is not None:
-        context["timeout"] = timeout
-    return context
+    return JenkinsRolloutContext(
+        namespace=namespace,
+        deployment=deployment,
+        timeout=timeout,
+        command=command,
+    )
 
 
 def refine_rollout_timeout(finding: Finding, evidence: KubernetesEvidence) -> None:
@@ -318,18 +321,17 @@ def _rollout_timeout_finding(investigation: BuildInvestigation) -> Finding | Non
     return None
 
 
-def _parse_rollout_command_with_regex(command: str) -> dict[str, str] | None:
+def _parse_rollout_command_with_regex(command: str) -> JenkinsRolloutContext | None:
     match = ROLLOUT_CONTEXT_PATTERN.search(command)
     if match is None:
         return None
 
-    context = {
-        "namespace": match.group("namespace"),
-        "deployment": match.group("deployment"),
-    }
-    if match.group("timeout"):
-        context["timeout"] = match.group("timeout")
-    return context
+    return JenkinsRolloutContext(
+        namespace=match.group("namespace"),
+        deployment=match.group("deployment"),
+        timeout=match.group("timeout"),
+        command=command,
+    )
 
 
 def _kubernetes_text_blocks(evidence: KubernetesEvidence) -> list[str]:
