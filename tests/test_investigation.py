@@ -126,6 +126,33 @@ def test_image_pull_backoff_refines_root_cause(tmp_path: Path, monkeypatch) -> N
     )
 
 
+def test_foreign_namespace_events_do_not_refine_root_cause(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        if command[:3] == ["kubectl", "get", "events"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    "57m Warning Unhealthy pod/database-0 Readiness probe failed\n"
+                    "4m Warning Unhealthy pod/other-api-123 Readiness probe failed\n"
+                ),
+                stderr="",
+            )
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.likely_root_cause is not None
+    assert result.likely_root_cause.root_cause == "Deployment rollout timed out"
+    assert all("database-0" not in line for line in result.likely_root_cause.evidence)
+    assert all("other-api-123" not in line for line in result.likely_root_cause.evidence)
+
+
 def test_debug_output_shows_investigation_steps(tmp_path: Path, monkeypatch) -> None:
     log_path = _write_failed_rollout_log(tmp_path)
     monkeypatch.chdir(tmp_path)

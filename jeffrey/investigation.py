@@ -167,7 +167,7 @@ def parse_rollout_command(command: str) -> dict[str, str] | None:
 
 
 def refine_rollout_timeout(finding: Finding, evidence: KubernetesEvidence) -> None:
-    combined = "\n".join(_kubernetes_text_blocks(evidence))
+    combined = "\n".join(_correlated_kubernetes_text_blocks(evidence))
     lower_combined = combined.lower()
 
     refinements = (
@@ -315,15 +315,80 @@ def _kubernetes_text_blocks(evidence: KubernetesEvidence) -> list[str]:
     return blocks
 
 
+def _correlated_kubernetes_text_blocks(evidence: KubernetesEvidence) -> list[str]:
+    blocks = []
+    if evidence.deployment_description is not None:
+        blocks.extend(
+            [
+                evidence.deployment_description.stdout,
+                evidence.deployment_description.stderr,
+            ]
+        )
+    if evidence.pods_output is not None:
+        blocks.extend(_related_pod_lines(evidence))
+    if evidence.events_output is not None:
+        blocks.extend(_related_event_lines(evidence))
+    for result in (
+        *evidence.pod_descriptions.values(),
+        *evidence.pod_logs.values(),
+        *evidence.pod_previous_logs.values(),
+    ):
+        blocks.extend([result.stdout, result.stderr])
+    return blocks
+
+
 def _important_evidence_lines(evidence: KubernetesEvidence, needle: str) -> list[str]:
     lines = []
-    for label, text in _labeled_kubernetes_text(evidence):
+    for label, text in _labeled_correlated_kubernetes_text(evidence):
         for line in text.splitlines():
             if needle.lower() in line.lower():
                 lines.append(f"{label}: {line.strip()}")
                 if len(lines) >= 3:
                     return lines
     return lines
+
+
+def _related_pod_lines(evidence: KubernetesEvidence) -> list[str]:
+    if evidence.pods_output is None:
+        return []
+
+    selected_pods = set(evidence.selected_pods)
+    lines = []
+    for line in evidence.pods_output.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("name "):
+            lines.append(stripped)
+            continue
+        pod_name = stripped.split()[0]
+        if pod_name in selected_pods:
+            lines.append(stripped)
+    return lines
+
+
+def _related_event_lines(evidence: KubernetesEvidence) -> list[str]:
+    if evidence.events_output is None:
+        return []
+
+    lines = []
+    selected_pods = set(evidence.selected_pods)
+    deployment_markers = {
+        f"deployment/{evidence.deployment}",
+        f'deployment "{evidence.deployment}"',
+        f"deployment.apps/{evidence.deployment}",
+    }
+
+    for line in evidence.events_output.stdout.splitlines():
+        if _line_mentions_selected_pod(line, selected_pods) or any(
+            marker in line for marker in deployment_markers
+        ):
+            lines.append(line)
+    return lines
+
+
+def _line_mentions_selected_pod(line: str, selected_pods: set[str]) -> bool:
+    return any(f"pod/{pod_name}" in line or pod_name in line for pod_name in selected_pods)
 
 
 def _important_kubernetes_summary(evidence: KubernetesEvidence) -> list[str]:
@@ -365,16 +430,16 @@ def _previous_logs_availability(evidence: KubernetesEvidence) -> str:
     return "unavailable"
 
 
-def _labeled_kubernetes_text(evidence: KubernetesEvidence) -> list[tuple[str, str]]:
+def _labeled_correlated_kubernetes_text(evidence: KubernetesEvidence) -> list[tuple[str, str]]:
     labeled = []
     if evidence.deployment_description is not None:
         labeled.append(("Kubernetes", evidence.deployment_description.stdout))
         labeled.append(("Kubernetes", evidence.deployment_description.stderr))
     if evidence.pods_output is not None:
-        labeled.append(("Kubernetes", evidence.pods_output.stdout))
+        labeled.append(("Kubernetes", "\n".join(_related_pod_lines(evidence))))
         labeled.append(("Kubernetes", evidence.pods_output.stderr))
     if evidence.events_output is not None:
-        labeled.append(("Kubernetes", evidence.events_output.stdout))
+        labeled.append(("Kubernetes", "\n".join(_related_event_lines(evidence))))
         labeled.append(("Kubernetes", evidence.events_output.stderr))
     for pod_name, result in evidence.pod_descriptions.items():
         labeled.append((f"Kubernetes pod {pod_name}", result.stdout))
