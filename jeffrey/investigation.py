@@ -5,19 +5,53 @@ import shlex
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from jeffrey.kubernetes import DEFAULT_KUBE_TIMEOUT, KubernetesCollector
-from jeffrey.models import BuildInvestigation, Finding, JenkinsRolloutContext, KubernetesEvidence
+from jeffrey.models import (
+    BuildInvestigation,
+    Finding,
+    JenkinsRolloutContext,
+    KubernetesEvidence,
+    LogInsight,
+    Severity,
+)
 from jeffrey.scanner import scan_build_log
 
 ROLLOUT_CONTEXT_PATTERN = re.compile(
     r"(?:--namespace(?:=|\s+)|-n\s+)'?(?P<namespace>[^'\s]+)'?.*?"
     r"rollout\s+status\s+deployment\s+(?P<deployment>[^\s']+).*?"
     r"(?:--timeout(?:=|\s+)'?(?P<timeout>[^'\s]+)'?)?",
+)
+JENKINS_TIMESTAMP_PATTERN = re.compile(r"\[(?P<timestamp>\d{4}-\d{2}-\d{2}T[^]]+Z)\]")
+
+LOG_PATTERNS: tuple[tuple[str, Severity, int], ...] = (
+    ("Traceback", Severity.CRITICAL, 1),
+    ("ModuleNotFoundError", Severity.CRITICAL, 2),
+    ("ImportError", Severity.CRITICAL, 3),
+    ("OOMKilled", Severity.CRITICAL, 4),
+    ("CrashLoopBackOff", Severity.CRITICAL, 5),
+    ("ImagePullBackOff", Severity.HIGH, 6),
+    ("CreateContainerConfigError", Severity.HIGH, 7),
+    ("readiness probe failed", Severity.HIGH, 8),
+    ("liveness probe failed", Severity.HIGH, 8),
+    ("connection refused", Severity.HIGH, 9),
+    ("permission denied", Severity.HIGH, 10),
+    ("no space left on device", Severity.HIGH, 11),
+    ("Exception", Severity.HIGH, 20),
+    ("CRITICAL", Severity.HIGH, 21),
+    ("FATAL", Severity.HIGH, 22),
+    ("Error", Severity.MEDIUM, 30),
+    ("timeout", Severity.MEDIUM, 31),
+    ("migration failed", Severity.HIGH, 12),
+    ("django.db", Severity.HIGH, 13),
+    ("pydantic", Severity.MEDIUM, 32),
+    ("gunicorn", Severity.MEDIUM, 33),
+    ("failed to start", Severity.HIGH, 14),
 )
 
 
@@ -94,8 +128,10 @@ def investigate_build_log(
             console=console,
         )
         k8s_evidence = collector.collect(context.namespace, context.deployment)
+        k8s_evidence.log_insights = analyze_log_insights(k8s_evidence)
         investigation.k8s_evidence = k8s_evidence
         _add_kubernetes_metadata(rollout_finding, k8s_evidence)
+        _add_current_state_warning(investigation, rollout_finding)
         _progress_for_evidence(console, k8s_evidence, enabled=debug)
 
         if progress is not None and task_id is not None:
@@ -140,6 +176,90 @@ def save_raw_evidence(evidence: KubernetesEvidence, directory: Path | None = Non
         encoding="utf-8",
     )
     return output_dir
+
+
+def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
+    if not evidence.selected_pods:
+        return [
+            LogInsight(
+                pod_name=evidence.deployment,
+                source="logs",
+                severity=Severity.MEDIUM,
+                message=(
+                    f"No pods were matched for deployment {evidence.deployment}, "
+                    "so pod logs could not be analyzed."
+                ),
+                matched_pattern="no matched pods",
+            )
+        ]
+
+    insights = []
+    for pod_name in evidence.selected_pods:
+        insights.extend(_insights_from_result(pod_name, "logs", evidence.pod_logs.get(pod_name)))
+        previous_result = evidence.pod_previous_logs.get(pod_name)
+        if previous_result is not None and not previous_result.succeeded:
+            insights.append(
+                LogInsight(
+                    pod_name=pod_name,
+                    source="previous_logs",
+                    severity=Severity.LOW,
+                    message="previous logs were not available",
+                    matched_pattern="previous logs unavailable",
+                )
+            )
+        else:
+            insights.extend(_insights_from_result(pod_name, "previous_logs", previous_result))
+
+        insights.extend(
+            _insights_from_result(pod_name, "describe", evidence.pod_descriptions.get(pod_name))
+        )
+        event_insights = _event_insights_from_result(
+            pod_name,
+            evidence.pod_events.get(pod_name),
+        )
+        if event_insights:
+            insights.extend(event_insights)
+        else:
+            insights.append(
+                LogInsight(
+                    pod_name=pod_name,
+                    source="events",
+                    severity=Severity.LOW,
+                    message="no correlated warning events found",
+                    matched_pattern="no correlated warning events",
+                )
+            )
+
+    suspicious = [
+        insight
+        for insight in insights
+        if insight.matched_pattern
+        not in {
+            "previous logs unavailable",
+            "no correlated warning events",
+        }
+    ]
+    if not suspicious:
+        return [
+            LogInsight(
+                pod_name=pod_name,
+                source="logs",
+                severity=Severity.LOW,
+                message=(
+                    f"Logs were collected for pod/{pod_name}, but no known error "
+                    "patterns were detected."
+                ),
+                matched_pattern="clean logs",
+            )
+            for pod_name in evidence.selected_pods[:1]
+        ] + [
+            insight
+            for insight in insights
+            if insight.matched_pattern
+            in {"previous logs unavailable", "no correlated warning events"}
+        ]
+
+    return sorted(insights, key=_log_insight_rank)
 
 
 def rollout_context_from_finding(finding: Finding) -> JenkinsRolloutContext | None:
@@ -197,6 +317,9 @@ def parse_rollout_command(command: str) -> JenkinsRolloutContext | None:
 
 
 def refine_rollout_timeout(finding: Finding, evidence: KubernetesEvidence) -> None:
+    if _refine_from_log_insights(finding, evidence.log_insights):
+        return
+
     combined = "\n".join(_correlated_kubernetes_text_blocks(evidence))
     lower_combined = combined.lower()
 
@@ -310,8 +433,172 @@ def _add_kubernetes_metadata(finding: Finding, evidence: KubernetesEvidence) -> 
             "unrelated_namespace_events_ignored": str(
                 evidence.unrelated_namespace_events_ignored
             ),
+            "first_pod": evidence.selected_pods[0] if evidence.selected_pods else "",
         }
     )
+
+
+def _add_current_state_warning(
+    investigation: BuildInvestigation,
+    finding: Finding,
+) -> None:
+    failed_at = _jenkins_failure_timestamp(finding)
+    if failed_at is None:
+        return
+    age = datetime.now(UTC) - failed_at
+    if age.total_seconds() > 600:
+        investigation.warnings.append(
+            "Kubernetes is being inspected now, but the Jenkins failure happened at "
+            f"{failed_at.isoformat().replace('+00:00', 'Z')}. Current cluster state may "
+            "differ from the failed build state."
+        )
+
+
+def _insights_from_result(
+    pod_name: str,
+    source: str,
+    result: object | None,
+) -> list[LogInsight]:
+    if result is None:
+        return []
+    text = "\n".join(
+        part
+        for part in (getattr(result, "stdout", ""), getattr(result, "stderr", ""))
+        if part
+    )
+    insights = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = _match_log_pattern(stripped)
+        if match is None:
+            continue
+        pattern, severity, _rank = match
+        insights.append(
+            LogInsight(
+                pod_name=pod_name,
+                source=source,
+                severity=severity,
+                message=stripped,
+                matched_pattern=pattern,
+            )
+        )
+    return insights
+
+
+def _event_insights_from_result(
+    pod_name: str,
+    result: object | None,
+) -> list[LogInsight]:
+    insights = []
+    for line in _pod_specific_event_lines(pod_name, result):
+        match = _match_log_pattern(line)
+        if match is None:
+            continue
+        pattern, severity, _rank = match
+        insights.append(
+            LogInsight(
+                pod_name=pod_name,
+                source="events",
+                severity=severity,
+                message=line.strip(),
+                matched_pattern=pattern,
+            )
+        )
+    return insights
+
+
+def _match_log_pattern(line: str) -> tuple[str, Severity, int] | None:
+    lower_line = line.lower()
+    for pattern, severity, rank in LOG_PATTERNS:
+        if pattern.lower() in lower_line:
+            return pattern, severity, rank
+    return None
+
+
+def _log_insight_rank(insight: LogInsight) -> tuple[int, int]:
+    for pattern, _severity, rank in LOG_PATTERNS:
+        if insight.matched_pattern.lower() == pattern.lower():
+            return (rank, _source_rank(insight.source))
+    low_priority = {
+        "previous logs unavailable": 90,
+        "no correlated warning events": 91,
+        "clean logs": 92,
+        "no matched pods": 93,
+    }
+    return (low_priority.get(insight.matched_pattern, 99), _source_rank(insight.source))
+
+
+def _source_rank(source: str) -> int:
+    ranks = {
+        "previous_logs": 0,
+        "logs": 1,
+        "describe": 2,
+        "events": 3,
+    }
+    return ranks.get(source, 9)
+
+
+def _refine_from_log_insights(finding: Finding, insights: list[LogInsight]) -> bool:
+    for insight in sorted(insights, key=_log_insight_rank):
+        pattern = insight.matched_pattern.lower()
+        if pattern == "modulenotfounderror":
+            _add_log_insight_evidence(finding, insight)
+            finding.root_cause = (
+                "Deployment rollout timed out because the application failed to start due to "
+                "a missing Python module."
+            )
+            finding.what_to_check_next = [
+                "Check requirements files",
+                "Check Docker image build",
+                "Check import path and startup command",
+            ]
+            return True
+        if pattern == "connection refused":
+            _add_log_insight_evidence(finding, insight)
+            finding.root_cause = (
+                "Deployment rollout timed out because the application or dependency refused "
+                "connections."
+            )
+            finding.what_to_check_next = [
+                "Check dependent services",
+                "Check ports and service names",
+                "Check application startup logs",
+            ]
+            return True
+        if pattern == "readiness probe failed":
+            _add_log_insight_evidence(finding, insight)
+            finding.root_cause = (
+                "Deployment rollout timed out because pods did not pass readiness checks."
+            )
+            finding.what_to_check_next = [
+                "Check readiness probe path and port",
+                "Check application startup time",
+                "Check pod logs and service dependencies",
+            ]
+            return True
+    return False
+
+
+def _add_log_insight_evidence(finding: Finding, insight: LogInsight) -> None:
+    source = insight.source.replace("_", " ")
+    line = f"pod/{insight.pod_name} {source}: {insight.message}"
+    if line not in finding.evidence:
+        finding.evidence.append(line)
+
+
+def _jenkins_failure_timestamp(finding: Finding) -> datetime | None:
+    for evidence in reversed(finding.evidence):
+        match = JENKINS_TIMESTAMP_PATTERN.search(evidence)
+        if match is None:
+            continue
+        raw_timestamp = match.group("timestamp")
+        try:
+            return datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
 
 
 def _rollout_timeout_finding(investigation: BuildInvestigation) -> Finding | None:

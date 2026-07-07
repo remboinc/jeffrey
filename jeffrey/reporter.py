@@ -36,6 +36,14 @@ def print_report(
 
     _print_finding(likely_root_cause, console, heading="Likely root cause")
 
+    if result.warnings:
+        console.print()
+        console.print("[bold yellow]Warning:[/bold yellow]")
+        for warning in result.warnings:
+            console.print(warning)
+
+    _print_log_insights(result, console)
+
     other_findings = result.findings[1:]
     if show_all and other_findings:
         console.print()
@@ -196,7 +204,7 @@ def _default_evidence_lines(finding: Finding) -> list[str]:
             )
         else:
             lines.append(
-                "Kubernetes evidence was collected, but no correlated pod failure was found"
+                "No correlated Kubernetes pod failure was found in current cluster state."
             )
         if finding.metadata.get("fallback_pod_matching_used") == "true":
             lines.append("Pod selector lookup failed; fallback pod name matching was used")
@@ -211,13 +219,12 @@ def _default_next_steps(finding: Finding) -> list[str]:
         return finding.what_to_check_next[:3]
 
     next_steps = []
-    if finding.metadata.get("events_checked") == "available":
-        next_steps.append("Open .jeffrey/namespace_events.txt")
+    first_pod = finding.metadata.get("first_pod")
     if int(finding.metadata.get("pods_checked", "0")) > 0:
         next_steps.append("Open .jeffrey/pods.txt")
-    if finding.metadata.get("previous_logs_checked") == "unavailable":
-        next_steps.append("Previous logs were not available")
-    next_steps.append("Run with --debug for detailed investigation steps")
+    if first_pod:
+        next_steps.append(f"Open .jeffrey/pod_{_safe_filename(first_pod)}_logs.txt")
+    next_steps.append("Re-run with --debug for full investigation trace")
     return next_steps[:3]
 
 
@@ -243,10 +250,27 @@ def _is_default_noise(evidence: str) -> bool:
         "Kubernetes pods output:",
         "Kubernetes events output:",
         "Kubernetes command failed:",
+        "Kubernetes evidence was collected",
         "previous terminated container",
         "not found",
     )
     return any(fragment in evidence for fragment in noisy_fragments)
+
+
+def _print_log_insights(result: ScanResult, console: Console) -> None:
+    evidence = result.k8s_evidence
+    if evidence is None:
+        return
+
+    console.print()
+    console.print("[bold]Log insights:[/bold]")
+    for insight in evidence.log_insights[:3]:
+        pod_ref = f"pod/{insight.pod_name}"
+        source = insight.source.replace("_", " ")
+        if insight.matched_pattern in {"clean logs", "no matched pods"}:
+            console.print(f"- {insight.message}")
+        else:
+            console.print(f"- {pod_ref} {source}: {insight.message}")
 
 
 def save_markdown_report(result: ScanResult, path: Path) -> None:
@@ -324,3 +348,10 @@ def _markdown_block(text: str) -> str:
     if not text:
         return "- Not available"
     return f"```text\n{text.rstrip()}\n```"
+
+
+def _safe_filename(value: str) -> str:
+    return "".join(
+        character if character.isalnum() or character in "_.-" else "_"
+        for character in value
+    )

@@ -12,6 +12,14 @@ class Severity(StrEnum):
     CRITICAL = "critical"
 
 
+class LogInsight(BaseModel):
+    pod_name: str
+    source: str
+    severity: Severity
+    message: str
+    matched_pattern: str
+
+
 class Finding(BaseModel):
     title: str
     severity: Severity
@@ -98,6 +106,7 @@ class KubernetesEvidence(BaseModel):
     pod_events: dict[str, CommandResult] = Field(default_factory=dict)
     pod_logs: dict[str, CommandResult] = Field(default_factory=dict)
     pod_previous_logs: dict[str, CommandResult] = Field(default_factory=dict)
+    log_insights: list[LogInsight] = Field(default_factory=list)
     command_errors: list[CommandResult] = Field(default_factory=list)
     executed_commands: list[CommandResult] = Field(default_factory=list)
     correlated_events_found: int = 0
@@ -122,6 +131,7 @@ class BuildInvestigation(BaseModel):
     last_lines: list[str] = Field(default_factory=list)
     duration_seconds: float | None = None
     raw_evidence_dir: str | None = None
+    warnings: list[str] = Field(default_factory=list)
 
     @property
     def has_findings(self) -> bool:

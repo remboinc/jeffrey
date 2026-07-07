@@ -132,6 +132,10 @@ def test_module_not_found_in_previous_logs_refines_root_cause(tmp_path: Path, mo
         "Deployment rollout timed out because the application failed to start due to "
         "a missing Python module."
     )
+    assert any(
+        insight.matched_pattern == "ModuleNotFoundError"
+        for insight in result.k8s_evidence.log_insights
+    )
 
 
 def test_image_pull_backoff_refines_root_cause(tmp_path: Path, monkeypatch) -> None:
@@ -145,6 +149,79 @@ def test_image_pull_backoff_refines_root_cause(tmp_path: Path, monkeypatch) -> N
     assert result.likely_root_cause.root_cause == (
         "Deployment rollout timed out because Kubernetes could not pull the Docker image."
     )
+
+
+def test_traceback_in_logs_produces_log_insight(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_signal("Traceback most recent call last"))
+
+    result = investigate_build_log(log_path)
+
+    assert result.k8s_evidence is not None
+    assert result.k8s_evidence.log_insights[0].matched_pattern == "Traceback"
+
+
+def test_connection_refused_in_logs_produces_log_insight_and_refines_root_cause(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_signal("connection refused"))
+
+    result = investigate_build_log(log_path)
+
+    assert result.likely_root_cause is not None
+    assert result.likely_root_cause.root_cause == (
+        "Deployment rollout timed out because the application or dependency refused connections."
+    )
+    assert any(
+        insight.matched_pattern == "connection refused"
+        for insight in result.k8s_evidence.log_insights
+    )
+
+
+def test_clean_logs_report_no_known_error_patterns(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_clean_logs)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    assert "no known error patterns were detected" in _normalized_output(output)
+
+
+def test_no_matched_pods_reports_logs_could_not_be_analyzed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        if command[:4] == ["kubectl", "get", "pods", "-n"]:
+            if "-o" in command:
+                return subprocess.CompletedProcess(command, 0, stdout='{"items":[]}', stderr="")
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="NAME READY STATUS RESTARTS AGE\n",
+                stderr="",
+            )
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    assert "pod logs could not be analyzed" in _normalized_output(output)
 
 
 def test_foreign_namespace_events_do_not_refine_root_cause(tmp_path: Path, monkeypatch) -> None:
@@ -213,7 +290,7 @@ def test_pod_specific_events_for_selected_pod_are_included(tmp_path: Path, monke
 
     assert result.likely_root_cause is not None
     assert result.likely_root_cause.root_cause == (
-        "Deployment rollout timed out because new pods did not pass readiness checks."
+        "Deployment rollout timed out because pods did not pass readiness checks."
     )
     assert any("web-app-abc-123" in line for line in result.likely_root_cause.evidence)
     assert all("database-0" not in line for line in result.likely_root_cause.evidence)
@@ -301,8 +378,8 @@ def test_default_output_says_no_correlated_failure_for_unrelated_events(
 
     print_report(result, console=console)
 
-    rendered = output.getvalue()
-    assert "Kubernetes evidence was collected, but no correlated pod failure was found" in rendered
+    rendered = _normalized_output(output)
+    assert "No correlated Kubernetes pod failure was found in current cluster state." in rendered
     assert "other-api-123" not in rendered
 
 
@@ -315,7 +392,7 @@ def test_debug_output_shows_investigation_steps(tmp_path: Path, monkeypatch) -> 
 
     investigate_build_log(log_path, debug=True, console=console)
 
-    rendered = output.getvalue()
+    rendered = _normalized_output(output)
     assert "[DEBUG] Reading Jenkins log..." in rendered
     assert "[DEBUG] Extracted namespace:" in rendered
     assert "[DEBUG] Extracted deployment:" in rendered
@@ -362,6 +439,81 @@ def test_default_output_hides_preflight_noise_and_previous_logs_bad_request(
     assert "previous terminated container" not in rendered
     assert "Error from server (BadRequest)" not in rendered
     assert "Raw evidence saved to:" in rendered
+
+
+def test_previous_logs_unavailable_is_log_insight_not_next_step(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_previous_logs_bad_request)
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "previous logs were not available" in rendered
+    next_steps = rendered.split("What to check next:", 1)[1]
+    assert "Previous logs were not available" not in next_steps
+
+
+def test_default_output_shows_max_three_log_insights(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_many_log_errors)
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    log_section = rendered.split("Log insights:", 1)[1].split("Raw evidence saved to:", 1)[0]
+    log_insight_lines = [
+        line
+        for line in log_section.splitlines()
+        if line.startswith("- pod/") or line.startswith("- Logs")
+    ]
+    assert len(log_insight_lines) <= 3
+
+
+def test_duplicate_generic_kubernetes_evidence_lines_are_removed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_clean_logs)
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert rendered.count("No correlated Kubernetes pod failure was found") <= 1
+    assert "Kubernetes evidence was collected, but no correlated pod/deployment" not in rendered
+
+
+def test_old_jenkins_timestamp_produces_current_state_warning(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path, timestamp="2020-01-01T00:00:00.000Z")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_clean_logs)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Warning:" in rendered
+    assert "2020-01-01T00:00:00Z" in rendered
 
 
 def test_debug_output_contains_preflight_details_and_command_errors(
@@ -546,14 +698,18 @@ def test_successful_rollout_still_reports_success(tmp_path: Path) -> None:
     assert result.successful_rollouts[0].name == "web-app"
 
 
-def _write_failed_rollout_log(tmp_path: Path) -> Path:
+def _write_failed_rollout_log(
+    tmp_path: Path,
+    *,
+    timestamp: str = "2026-07-06T13:36:20.261Z",
+) -> Path:
     log_path = tmp_path / "failed.log"
     log_path.write_text(
         "\n".join(
             [
                 "[Pipeline] { (Deploy)",
-                f"[2026-07-06T13:36:20.261Z] + {ROLLOUT_COMMAND}",
-                "[2026-07-06T13:38:57.386Z] error: timed out waiting for the condition",
+                f"[{timestamp}] + {ROLLOUT_COMMAND}",
+                f"[{timestamp}] error: timed out waiting for the condition",
                 "Finished: FAILURE",
             ]
         ),
@@ -633,3 +789,35 @@ def _fake_run_with_previous_logs_bad_request(
             ),
         )
     return _completed(command)
+
+
+def _fake_run_with_clean_logs(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+    if command[:3] == ["kubectl", "logs", "web-app-abc-123"]:
+        return subprocess.CompletedProcess(command, 0, stdout="Application started\n", stderr="")
+    if (
+        command[:3] == ["kubectl", "get", "events"]
+        and any("involvedObject.name=web-app-abc-123" in part for part in command)
+    ):
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+    return _completed(command)
+
+
+def _fake_run_with_many_log_errors(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+    if command[:3] == ["kubectl", "logs", "web-app-abc-123"]:
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "Traceback most recent call last\n"
+                "ModuleNotFoundError: No module named app\n"
+                "connection refused\n"
+                "permission denied\n"
+                "no space left on device\n"
+            ),
+            stderr="",
+        )
+    return _completed(command)
+
+
+def _normalized_output(output: StringIO) -> str:
+    return " ".join(output.getvalue().split())
