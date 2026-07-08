@@ -249,6 +249,7 @@ def _is_default_noise(evidence: str) -> bool:
         "Kubernetes deployment description:",
         "Kubernetes pods output:",
         "Kubernetes events output:",
+        "Kubernetes namespace events output:",
         "Kubernetes command failed:",
         "Kubernetes evidence was collected",
         "previous terminated container",

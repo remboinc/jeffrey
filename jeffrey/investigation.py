@@ -39,9 +39,12 @@ LOG_PATTERNS: tuple[tuple[str, Severity, int], ...] = (
     ("CreateContainerConfigError", Severity.HIGH, 7),
     ("readiness probe failed", Severity.HIGH, 8),
     ("liveness probe failed", Severity.HIGH, 8),
+    ("startup probe failed", Severity.HIGH, 8),
     ("connection refused", Severity.HIGH, 9),
     ("permission denied", Severity.HIGH, 10),
     ("no space left on device", Severity.HIGH, 11),
+    ("Back-off", Severity.HIGH, 15),
+    ("Unhealthy", Severity.HIGH, 16),
     ("Exception", Severity.HIGH, 20),
     ("CRITICAL", Severity.HIGH, 21),
     ("FATAL", Severity.HIGH, 22),
@@ -471,6 +474,8 @@ def _insights_from_result(
         stripped = line.strip()
         if not stripped:
             continue
+        if source == "describe" and _is_probe_configuration_line(stripped):
+            continue
         match = _match_log_pattern(stripped)
         if match is None:
             continue
@@ -485,6 +490,10 @@ def _insights_from_result(
             )
         )
     return insights
+
+
+def _is_probe_configuration_line(line: str) -> bool:
+    return line.startswith(("Liveness:", "Readiness:", "Startup:"))
 
 
 def _event_insights_from_result(

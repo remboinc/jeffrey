@@ -6,7 +6,12 @@ from pathlib import Path
 
 from rich.console import Console
 
-from jeffrey.investigation import investigate_build_log, parse_rollout_command, save_raw_evidence
+from jeffrey.investigation import (
+    analyze_log_insights,
+    investigate_build_log,
+    parse_rollout_command,
+    save_raw_evidence,
+)
 from jeffrey.models import CommandResult, KubernetesEvidence
 from jeffrey.reporter import print_report, save_markdown_report
 
@@ -224,6 +229,66 @@ def test_no_matched_pods_reports_logs_could_not_be_analyzed(
     assert "pod logs could not be analyzed" in _normalized_output(output)
 
 
+def test_probe_configuration_lines_do_not_create_log_insights() -> None:
+    evidence = KubernetesEvidence(
+        namespace="demo",
+        deployment="web-app",
+        selected_pods=["web-app-abc-123"],
+        pod_descriptions={
+            "web-app-abc-123": CommandResult(
+                command=["kubectl", "describe", "pod", "web-app-abc-123"],
+                exit_code=0,
+                stdout=(
+                    "Liveness: http-get http://:8080/health delay=10s timeout=1s\n"
+                    "Readiness: http-get http://:8080/ready delay=5s timeout=1s\n"
+                    "Startup: http-get http://:8080/start delay=1s timeout=1s\n"
+                ),
+            )
+        },
+        pod_logs={
+            "web-app-abc-123": CommandResult(
+                command=["kubectl", "logs", "web-app-abc-123"],
+                exit_code=0,
+                stdout="Application started\n",
+            )
+        },
+    )
+
+    insights = analyze_log_insights(evidence)
+
+    assert all(insight.source != "describe" for insight in insights)
+    assert insights[0].matched_pattern == "clean logs"
+
+
+def test_readiness_probe_failure_in_describe_creates_log_insight() -> None:
+    evidence = KubernetesEvidence(
+        namespace="demo",
+        deployment="web-app",
+        selected_pods=["web-app-abc-123"],
+        pod_descriptions={
+            "web-app-abc-123": CommandResult(
+                command=["kubectl", "describe", "pod", "web-app-abc-123"],
+                exit_code=0,
+                stdout="Warning Unhealthy Readiness probe failed: HTTP probe failed\n",
+            )
+        },
+        pod_logs={
+            "web-app-abc-123": CommandResult(
+                command=["kubectl", "logs", "web-app-abc-123"],
+                exit_code=0,
+                stdout="Application started\n",
+            )
+        },
+    )
+
+    insights = analyze_log_insights(evidence)
+
+    assert any(
+        insight.source == "describe" and insight.matched_pattern == "readiness probe failed"
+        for insight in insights
+    )
+
+
 def test_foreign_namespace_events_do_not_refine_root_cause(tmp_path: Path, monkeypatch) -> None:
     log_path = _write_failed_rollout_log(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -380,6 +445,7 @@ def test_default_output_says_no_correlated_failure_for_unrelated_events(
 
     rendered = _normalized_output(output)
     assert "No correlated Kubernetes pod failure was found in current cluster state." in rendered
+    assert "Kubernetes namespace events output: available" not in rendered
     assert "other-api-123" not in rendered
 
 
