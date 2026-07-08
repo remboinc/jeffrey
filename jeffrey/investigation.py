@@ -198,7 +198,19 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
 
     insights = []
     for pod_name in evidence.selected_pods:
-        insights.extend(_insights_from_result(pod_name, "logs", evidence.pod_logs.get(pod_name)))
+        logs_result = evidence.pod_logs.get(pod_name)
+        if logs_result is None or not logs_result.succeeded:
+            insights.append(
+                LogInsight(
+                    pod_name=pod_name,
+                    source="logs",
+                    severity=Severity.MEDIUM,
+                    message="Application logs could not be collected.",
+                    matched_pattern="logs unavailable",
+                )
+            )
+        else:
+            insights.extend(_insights_from_result(pod_name, "logs", logs_result))
         previous_result = evidence.pod_previous_logs.get(pod_name)
         if previous_result is not None and not previous_result.succeeded:
             insights.append(
@@ -240,18 +252,26 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
         not in {
             "previous logs unavailable",
             "no correlated warning events",
+            "logs unavailable",
         }
     ]
     if not suspicious:
+        unavailable_log_insights = [
+            insight for insight in insights if insight.matched_pattern == "logs unavailable"
+        ]
+        if unavailable_log_insights:
+            return unavailable_log_insights + [
+                insight
+                for insight in insights
+                if insight.matched_pattern
+                in {"previous logs unavailable", "no correlated warning events"}
+            ]
         return [
             LogInsight(
                 pod_name=pod_name,
                 source="logs",
                 severity=Severity.LOW,
-                message=(
-                    f"Logs were collected for pod/{pod_name}, but no known error "
-                    "patterns were detected."
-                ),
+                message="No known startup errors were found in the application logs.",
                 matched_pattern="clean logs",
             )
             for pod_name in evidence.selected_pods[:1]
@@ -259,7 +279,11 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
             insight
             for insight in insights
             if insight.matched_pattern
-            in {"previous logs unavailable", "no correlated warning events"}
+            in {
+                "previous logs unavailable",
+                "no correlated warning events",
+                "logs unavailable",
+            }
         ]
 
     return sorted(insights, key=_log_insight_rank)
@@ -533,6 +557,7 @@ def _log_insight_rank(insight: LogInsight) -> tuple[int, int]:
     low_priority = {
         "previous logs unavailable": 90,
         "no correlated warning events": 91,
+        "logs unavailable": 91,
         "clean logs": 92,
         "no matched pods": 93,
     }

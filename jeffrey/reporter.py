@@ -219,11 +219,10 @@ def _default_next_steps(finding: Finding) -> list[str]:
         return finding.what_to_check_next[:3]
 
     next_steps = []
-    first_pod = finding.metadata.get("first_pod")
     if int(finding.metadata.get("pods_checked", "0")) > 0:
         next_steps.append("Open .jeffrey/pods.txt")
-    if first_pod:
-        next_steps.append(f"Open .jeffrey/pod_{_safe_filename(first_pod)}_logs.txt")
+    if finding.metadata.get("correlated_events_found", "0") != "0":
+        next_steps.append("Review correlated pod events in the report above")
     next_steps.append("Re-run with --debug for full investigation trace")
     return next_steps[:3]
 
@@ -264,7 +263,7 @@ def _print_log_insights(result: ScanResult, console: Console) -> None:
         return
 
     console.print()
-    console.print("[bold]Log insights:[/bold]")
+    console.print("[bold]Application log analysis:[/bold]")
     for insight in evidence.log_insights[:3]:
         pod_ref = f"pod/{insight.pod_name}"
         source = insight.source.replace("_", " ")

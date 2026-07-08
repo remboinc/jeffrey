@@ -197,7 +197,9 @@ def test_clean_logs_report_no_known_error_patterns(tmp_path: Path, monkeypatch) 
     console = Console(file=output, force_terminal=False)
     print_report(result, console=console)
 
-    assert "no known error patterns were detected" in _normalized_output(output)
+    assert "No known startup errors were found in the application logs." in _normalized_output(
+        output
+    )
 
 
 def test_no_matched_pods_reports_logs_could_not_be_analyzed(
@@ -227,6 +229,27 @@ def test_no_matched_pods_reports_logs_could_not_be_analyzed(
     print_report(result, console=console)
 
     assert "pod logs could not be analyzed" in _normalized_output(output)
+
+
+def test_application_logs_unavailable_are_reported(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        if command[:3] == ["kubectl", "logs", "web-app-abc-123"]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="logs failed")
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Application logs could not be collected." in rendered
+    assert "pod_web-app-abc-123_logs.txt" not in rendered
 
 
 def test_probe_configuration_lines_do_not_create_log_insights() -> None:
@@ -537,7 +560,10 @@ def test_default_output_shows_max_three_log_insights(tmp_path: Path, monkeypatch
     print_report(result, console=console)
 
     rendered = output.getvalue()
-    log_section = rendered.split("Log insights:", 1)[1].split("Raw evidence saved to:", 1)[0]
+    log_section = rendered.split("Application log analysis:", 1)[1].split(
+        "Raw evidence saved to:",
+        1,
+    )[0]
     log_insight_lines = [
         line
         for line in log_section.splitlines()
