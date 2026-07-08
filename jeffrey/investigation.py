@@ -11,6 +11,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from jeffrey import messages as msg
 from jeffrey.kubernetes import DEFAULT_KUBE_TIMEOUT, KubernetesCollector
 from jeffrey.models import (
     BuildInvestigation,
@@ -218,10 +219,7 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
                 pod_name=evidence.deployment,
                 source="logs",
                 severity=Severity.MEDIUM,
-                message=(
-                    f"No pods were matched for deployment {evidence.deployment}, "
-                    "so pod logs could not be analyzed."
-                ),
+                message=msg.no_pods_matched(evidence.deployment),
                 matched_pattern="no matched pods",
             )
         ]
@@ -235,7 +233,7 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
                     pod_name=pod_name,
                     source="logs",
                     severity=Severity.MEDIUM,
-                    message="Application logs could not be collected.",
+                    message=msg.application_logs_unavailable(),
                     matched_pattern="logs unavailable",
                 )
             )
@@ -249,7 +247,7 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
                         pod_name=pod_name,
                         source="logs",
                         severity=Severity.LOW,
-                        message="No known startup errors were found in the application logs.",
+                        message=msg.no_startup_errors(),
                         matched_pattern="clean logs",
                     )
                 )
@@ -260,7 +258,7 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
                     pod_name=pod_name,
                     source="previous_logs",
                     severity=Severity.LOW,
-                    message="previous logs were not available",
+                    message=msg.previous_logs_not_available(),
                     matched_pattern="previous logs unavailable",
                 )
             )
@@ -282,7 +280,7 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
                     pod_name=pod_name,
                     source="events",
                     severity=Severity.LOW,
-                    message="no correlated warning events found",
+                    message=msg.no_correlated_warning_events(),
                     matched_pattern="no correlated warning events",
                 )
             )
@@ -331,10 +329,7 @@ def extract_log_excerpts(evidence: KubernetesEvidence) -> list[LogExcerpt]:
                 source="logs",
                 severity="info",
                 label="UNKNOWN",
-                message=(
-                    f"No pods were matched for deployment {evidence.deployment}, "
-                    "so pod logs could not be analyzed."
-                ),
+                message=msg.no_pods_matched(evidence.deployment),
                 matched_pattern="no matched pods",
                 score=0,
             )
@@ -353,7 +348,7 @@ def extract_log_excerpts(evidence: KubernetesEvidence) -> list[LogExcerpt]:
                         source=source,
                         severity="info",
                         label="UNKNOWN",
-                        message=_unavailable_log_message(source, pod_name),
+                        message=msg.log_unavailable(source, pod_name),
                         matched_pattern=f"{source} unavailable",
                         score=0,
                     )
@@ -374,10 +369,7 @@ def extract_log_excerpts(evidence: KubernetesEvidence) -> list[LogExcerpt]:
                         source=source,
                         severity="info",
                         label="UNKNOWN",
-                        message=(
-                            f"Logs were collected for pod/{pod_name}, but no suspicious "
-                            "application log lines were detected."
-                        ),
+                        message=msg.no_suspicious_log_lines(pod_name),
                         matched_pattern="clean logs",
                         score=0,
                     )
@@ -508,11 +500,6 @@ def _trim_log_message(message: str, limit: int = 180) -> str:
     return message[: limit - 3].rstrip() + "..."
 
 
-def _unavailable_log_message(source: str, pod_name: str) -> str:
-    label = "Current" if source == "logs" else "Previous"
-    return f"{label} logs were not available for pod/{pod_name}."
-
-
 def rollout_context_from_finding(finding: Finding) -> JenkinsRolloutContext | None:
     for evidence in finding.evidence:
         if evidence.startswith("Jenkins rollout command: "):
@@ -579,81 +566,48 @@ def refine_rollout_timeout(finding: Finding, evidence: KubernetesEvidence) -> No
     refinements = (
         (
             "CrashLoopBackOff",
-            "Deployment rollout timed out because one or more pods are crashing after startup.",
-            [
-                "Inspect previous container logs",
-                "Check application startup errors",
-                "Check environment variables and secrets",
-            ],
+            msg.ROOT_CAUSE_CRASH_LOOP,
+            msg.NEXT_STEPS_STARTUP,
         ),
         (
             "ImagePullBackOff",
-            "Deployment rollout timed out because Kubernetes could not pull the Docker image.",
-            ["Check image tag", "Check registry credentials", "Check whether the image exists"],
+            msg.ROOT_CAUSE_IMAGE_PULL,
+            msg.NEXT_STEPS_IMAGE_PULL,
         ),
         (
             "ErrImagePull",
-            "Deployment rollout timed out because Kubernetes could not pull the Docker image.",
-            ["Check image tag", "Check registry credentials", "Check whether the image exists"],
+            msg.ROOT_CAUSE_IMAGE_PULL,
+            msg.NEXT_STEPS_IMAGE_PULL,
         ),
         (
             "OOMKilled",
-            "Deployment rollout timed out because a container was killed due to memory limits.",
-            [
-                "Check memory limits",
-                "Check recent memory usage",
-                "Compare with the previous successful deployment",
-            ],
+            msg.ROOT_CAUSE_OOM_KILLED,
+            msg.NEXT_STEPS_MEMORY,
         ),
         (
             "CreateContainerConfigError",
-            (
-                "Deployment rollout timed out because Kubernetes could not create the "
-                "container configuration."
-            ),
-            [
-                "Check ConfigMap references",
-                "Check Secret references",
-                "Check environment variable definitions",
-            ],
+            msg.ROOT_CAUSE_CONTAINER_CONFIG,
+            msg.NEXT_STEPS_CONTAINER_CONFIG,
         ),
         (
             "Readiness probe failed",
-            "Deployment rollout timed out because new pods did not pass readiness checks.",
-            [
-                "Check readiness probe path and port",
-                "Check application startup time",
-                "Check pod logs and service dependencies",
-            ],
+            msg.ROOT_CAUSE_READINESS_FAILED,
+            msg.NEXT_STEPS_READINESS,
         ),
         (
             "connection refused",
-            (
-                "Deployment rollout timed out because the application or one of its "
-                "dependencies refused connections."
-            ),
-            [
-                "Check dependent services",
-                "Check ports and service names",
-                "Check application startup logs",
-            ],
+            msg.ROOT_CAUSE_DEPENDENCY_CONNECTION_REFUSED,
+            msg.NEXT_STEPS_CONNECTION,
         ),
         (
             "ModuleNotFoundError",
-            (
-                "Deployment rollout timed out because the application failed to start due to "
-                "a missing Python module."
-            ),
-            [
-                "Check requirements files",
-                "Check Docker image build",
-                "Check import path and startup command",
-            ],
+            msg.ROOT_CAUSE_MISSING_PYTHON_MODULE,
+            msg.NEXT_STEPS_PYTHON_IMPORT,
         ),
         (
             "permission denied",
-            "Deployment rollout timed out because the application hit a permission error.",
-            ["Check file permissions", "Check container user", "Check mounted volumes"],
+            msg.ROOT_CAUSE_PERMISSION_ERROR,
+            msg.NEXT_STEPS_PERMISSION,
         ),
     )
 
@@ -687,36 +641,21 @@ def _refine_from_log_excerpts(finding: Finding, evidence: KubernetesEvidence) ->
     if "PANIC" in top_labels:
         _add_log_excerpt_evidence(finding, actionable[0])
         if has_readiness:
-            finding.root_cause = (
-                "Deployment rollout timed out because the application did not reliably "
-                "respond to readiness checks and pod logs show panic recovery events."
-            )
+            finding.root_cause = msg.ROOT_CAUSE_PANIC_WITH_READINESS
         else:
-            finding.root_cause = (
-                "Deployment rollout timed out because pod logs show application panic "
-                "recovery events."
-            )
+            finding.root_cause = msg.ROOT_CAUSE_PANIC
         return True
     if "MODULE_NOT_FOUND" in top_labels:
         _add_log_excerpt_evidence(finding, actionable[0])
-        finding.root_cause = (
-            "Deployment rollout timed out because the application failed to start due to "
-            "a missing Python module."
-        )
+        finding.root_cause = msg.ROOT_CAUSE_MISSING_PYTHON_MODULE
         return True
     if "IMPORT_ERROR" in top_labels:
         _add_log_excerpt_evidence(finding, actionable[0])
-        finding.root_cause = (
-            "Deployment rollout timed out because the application failed to start due to "
-            "a Python import error."
-        )
+        finding.root_cause = msg.ROOT_CAUSE_IMPORT_ERROR
         return True
     if "CONNECTION_REFUSED" in top_labels:
         _add_log_excerpt_evidence(finding, actionable[0])
-        finding.root_cause = (
-            "Deployment rollout timed out because application logs show refused "
-            "connections."
-        )
+        finding.root_cause = msg.ROOT_CAUSE_APP_LOGS_CONNECTION_REFUSED
         return True
     return False
 
@@ -753,9 +692,7 @@ def _add_current_state_warning(
     age = datetime.now(UTC) - failed_at
     if age.total_seconds() > 600:
         investigation.warnings.append(
-            "Kubernetes is being inspected now, but the Jenkins failure happened at "
-            f"{failed_at.isoformat().replace('+00:00', 'Z')}. Current cluster state may "
-            "differ from the failed build state."
+            msg.current_state_warning(failed_at.isoformat().replace("+00:00", "Z"))
         )
 
 
@@ -865,60 +802,31 @@ def _refine_from_log_insights(finding: Finding, insights: list[LogInsight]) -> b
         for insight in readiness_insights[:2]:
             _add_log_insight_evidence(finding, insight)
         if refused and timed_out:
-            finding.root_cause = (
-                "Deployment rollout timed out because the application did not reliably "
-                "respond to readiness checks."
-            )
+            finding.root_cause = msg.ROOT_CAUSE_READINESS_UNRELIABLE
             return True
         if refused:
-            finding.root_cause = (
-                "Deployment rollout timed out because the application was not accepting "
-                "connections on the readiness port."
-            )
+            finding.root_cause = msg.ROOT_CAUSE_READINESS_PORT_REFUSED
             return True
         if timed_out:
-            finding.root_cause = (
-                "Deployment rollout timed out because readiness checks timed out before "
-                "the application responded."
-            )
+            finding.root_cause = msg.ROOT_CAUSE_READINESS_TIMED_OUT
             return True
 
     for insight in sorted(insights, key=_log_insight_rank):
         pattern = insight.matched_pattern.lower()
         if pattern == "modulenotfounderror":
             _add_log_insight_evidence(finding, insight)
-            finding.root_cause = (
-                "Deployment rollout timed out because the application failed to start due to "
-                "a missing Python module."
-            )
-            finding.what_to_check_next = [
-                "Check requirements files",
-                "Check Docker image build",
-                "Check import path and startup command",
-            ]
+            finding.root_cause = msg.ROOT_CAUSE_MISSING_PYTHON_MODULE
+            finding.what_to_check_next = list(msg.NEXT_STEPS_PYTHON_IMPORT)
             return True
         if pattern == "connection refused":
             _add_log_insight_evidence(finding, insight)
-            finding.root_cause = (
-                "Deployment rollout timed out because the application or dependency refused "
-                "connections."
-            )
-            finding.what_to_check_next = [
-                "Check dependent services",
-                "Check ports and service names",
-                "Check application startup logs",
-            ]
+            finding.root_cause = msg.ROOT_CAUSE_APP_LOGS_CONNECTION_REFUSED
+            finding.what_to_check_next = list(msg.NEXT_STEPS_CONNECTION)
             return True
         if pattern == "readiness probe failed":
             _add_log_insight_evidence(finding, insight)
-            finding.root_cause = (
-                "Deployment rollout timed out because pods did not pass readiness checks."
-            )
-            finding.what_to_check_next = [
-                "Check readiness probe path and port",
-                "Check application startup time",
-                "Check pod logs and service dependencies",
-            ]
+            finding.root_cause = msg.ROOT_CAUSE_READINESS_FAILED
+            finding.what_to_check_next = list(msg.NEXT_STEPS_READINESS)
             return True
     return False
 

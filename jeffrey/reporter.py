@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from jeffrey import messages as msg
 from jeffrey.models import Finding, ScanResult
 
 
@@ -20,7 +21,7 @@ def print_report(
     verbose: bool = False,
 ) -> None:
     console = console or Console()
-    console.print("[bold]Jeffrey investigation report[/bold]")
+    console.print(f"[bold]{msg.REPORT_TITLE}[/bold]")
     console.print()
 
     if result.is_success and not result.has_findings:
@@ -36,7 +37,7 @@ def print_report(
         _print_unknown(result, console)
         return
 
-    _print_finding(likely_root_cause, result, console, heading="Likely root cause")
+    _print_finding(likely_root_cause, result, console, heading=msg.SECTION_LIKELY_ROOT_CAUSE)
     _print_kubernetes_signal(result, console)
     _print_relevant_log_excerpts(result, console)
     _print_jeffrey_conclusion(result, console)
@@ -44,20 +45,20 @@ def print_report(
 
     if result.warnings:
         console.print()
-        console.print("[bold yellow]Warning:[/bold yellow]")
+        console.print(f"[bold yellow]{msg.SECTION_WARNING}:[/bold yellow]")
         for warning in result.warnings:
             console.print(warning)
 
     other_findings = result.findings[1:]
     if show_all and other_findings:
         console.print()
-        console.print("[bold]All detected findings[/bold]")
+        console.print(f"[bold]{msg.SECTION_ALL_DETECTED_FINDINGS}[/bold]")
         for finding in other_findings:
             console.print()
             _print_finding(finding, result, console, heading=finding.title)
     elif other_findings:
         console.print()
-        console.print("[bold]Also detected:[/bold]")
+        console.print(f"[bold]{msg.SECTION_ALSO_DETECTED}:[/bold]")
         for finding in other_findings:
             console.print(f"- {finding.title}")
 
@@ -78,28 +79,28 @@ def _print_finding(
     console.print(f"[bold]{heading}:[/bold]")
     console.print(finding.root_cause if finding.root_cause else finding.title)
     console.print()
-    console.print("[bold]Stage:[/bold]")
-    console.print(finding.stage or "Unknown")
+    console.print(f"[bold]{msg.SECTION_STAGE}:[/bold]")
+    console.print(finding.stage or msg.UNKNOWN_VALUE)
 
     deployment = finding.metadata.get("deployment")
     namespace = finding.metadata.get("namespace")
     if deployment:
         console.print()
-        console.print("[bold]Deployment:[/bold]")
+        console.print(f"[bold]{msg.SECTION_DEPLOYMENT}:[/bold]")
         console.print(deployment)
     if namespace:
         console.print()
-        console.print("[bold]Namespace:[/bold]")
+        console.print(f"[bold]{msg.SECTION_NAMESPACE}:[/bold]")
         console.print(namespace)
 
     console.print()
-    console.print("[bold]Evidence:[/bold]")
+    console.print(f"[bold]{msg.SECTION_EVIDENCE}:[/bold]")
     for evidence in _default_evidence_lines(finding, result):
         console.print(f"- {evidence}")
 
 
 def _print_unknown(result: ScanResult, console: Console) -> None:
-    console.print("Jeffrey could not determine the root cause yet")
+    console.print(msg.UNKNOWN_ROOT_CAUSE)
     console.print()
 
     table = Table.grid(expand=True)
@@ -107,18 +108,18 @@ def _print_unknown(result: ScanResult, console: Console) -> None:
     for line in result.last_lines:
         table.add_row(line)
 
-    console.print(Panel(table, title="Last log lines", border_style="yellow"))
+    console.print(Panel(table, title=msg.LAST_LOG_LINES_TITLE, border_style="yellow"))
 
 
 def _print_success(result: ScanResult, console: Console, *, verbose: bool) -> None:
-    console.print("[bold green]Build finished successfully.[/bold green]")
-    console.print("There is no failure root cause to investigate.")
+    console.print(f"[bold green]{msg.BUILD_SUCCESS}[/bold green]")
+    console.print(msg.NO_FAILURE_TO_INVESTIGATE)
 
     if not result.successful_steps:
         return
 
     console.print()
-    console.print("[bold]Successful rollout steps:[/bold]")
+    console.print(f"[bold]{msg.SECTION_SUCCESSFUL_ROLLOUT_STEPS}:[/bold]")
     for step in result.successful_steps:
         console.print(f"- {step}")
 
@@ -129,7 +130,7 @@ def _print_success(result: ScanResult, console: Console, *, verbose: bool) -> No
 
 
 def _print_collected_evidence(finding: Finding, console: Console) -> None:
-    console.print("[bold]Collected evidence:[/bold]")
+    console.print(f"[bold]{msg.SECTION_COLLECTED_EVIDENCE}:[/bold]")
     deployment_description = finding.metadata.get("deployment_description", "unavailable")
     previous_logs_checked = finding.metadata.get("previous_logs_checked", "unavailable")
     console.print(f"- Deployment description: {deployment_description}")
@@ -143,39 +144,39 @@ def _print_compact_summary(result: ScanResult, console: Console) -> None:
     metadata = finding.metadata if finding is not None else {}
     evidence = result.k8s_evidence
 
-    console.print("[bold]Investigation summary[/bold]")
+    console.print(f"[bold]{msg.SECTION_INVESTIGATION_SUMMARY}[/bold]")
     console.print()
-    console.print("[bold]Build:[/bold]")
+    console.print(f"[bold]{msg.SECTION_BUILD}:[/bold]")
     console.print(result.build_status or result.status.upper())
     console.print()
-    console.print("[bold]Stage:[/bold]")
-    console.print(finding.stage if finding is not None and finding.stage else "Unknown")
+    console.print(f"[bold]{msg.SECTION_STAGE}:[/bold]")
+    console.print(finding.stage if finding is not None and finding.stage else msg.UNKNOWN_VALUE)
     console.print()
-    console.print("[bold]Deployment:[/bold]")
-    console.print(metadata.get("deployment") or _successful_deployment(result) or "Unknown")
+    console.print(f"[bold]{msg.SECTION_DEPLOYMENT}:[/bold]")
+    console.print(metadata.get("deployment") or _successful_deployment(result) or msg.UNKNOWN_VALUE)
     console.print()
-    console.print("[bold]Namespace:[/bold]")
-    console.print(metadata.get("namespace") or "Unknown")
+    console.print(f"[bold]{msg.SECTION_NAMESPACE}:[/bold]")
+    console.print(metadata.get("namespace") or msg.UNKNOWN_VALUE)
     console.print()
-    console.print("[bold]Pods investigated:[/bold]")
+    console.print(f"[bold]{msg.SECTION_PODS_INVESTIGATED}:[/bold]")
     console.print(str(evidence.pods_checked if evidence is not None else 0))
     console.print()
-    console.print("[bold]Selector:[/bold]")
-    console.print(metadata.get("selector") or "Unknown")
+    console.print(f"[bold]{msg.SECTION_SELECTOR}:[/bold]")
+    console.print(metadata.get("selector") or msg.UNKNOWN_VALUE)
     console.print()
-    console.print("[bold]Correlated events found:[/bold]")
+    console.print(f"[bold]{msg.SECTION_CORRELATED_EVENTS_FOUND}:[/bold]")
     console.print(metadata.get("correlated_events_found", "0"))
     console.print()
-    console.print("[bold]Unrelated namespace events ignored:[/bold]")
+    console.print(f"[bold]{msg.SECTION_UNRELATED_NAMESPACE_EVENTS_IGNORED}:[/bold]")
     console.print(metadata.get("unrelated_namespace_events_ignored", "0"))
     console.print()
-    console.print("[bold]Events collected:[/bold]")
+    console.print(f"[bold]{msg.SECTION_EVENTS_COLLECTED}:[/bold]")
     console.print(_yes_no(evidence is not None and evidence.namespace_events_output is not None))
     console.print()
-    console.print("[bold]Previous logs:[/bold]")
+    console.print(f"[bold]{msg.SECTION_PREVIOUS_LOGS}:[/bold]")
     console.print(_yes_no(evidence is not None and evidence.previous_logs_checked))
     console.print()
-    console.print("[bold]Duration:[/bold]")
+    console.print(f"[bold]{msg.SECTION_DURATION}:[/bold]")
     duration = result.duration_seconds if result.duration_seconds is not None else 0
     console.print(f"{duration:.1f} seconds")
 
@@ -184,7 +185,7 @@ def _print_raw_evidence_path(result: ScanResult, console: Console) -> None:
     if result.raw_evidence_dir is None:
         return
     console.print()
-    console.print("[bold]Raw evidence saved to:[/bold]")
+    console.print(f"[bold]{msg.SECTION_RAW_EVIDENCE}:[/bold]")
     console.print(f"{result.raw_evidence_dir}/")
 
 
@@ -194,9 +195,9 @@ def _default_evidence_lines(finding: Finding, result: ScanResult) -> list[str]:
     for evidence in finding.evidence:
         if evidence.startswith("Jenkins rollout command: "):
             if timeout:
-                lines.append(f"Jenkins rollout command timed out after {timeout}")
+                lines.append(msg.jenkins_rollout_timed_out(timeout))
             else:
-                lines.append("Jenkins rollout command timed out")
+                lines.append(msg.jenkins_rollout_timed_out(None))
             continue
         if _is_default_noise(evidence):
             continue
@@ -206,13 +207,13 @@ def _default_evidence_lines(finding: Finding, result: ScanResult) -> list[str]:
     if signals:
         lines.extend(_evidence_from_kubernetes_signals(signals))
     elif finding.metadata.get("has_k8s_evidence") == "true":
-        lines.append("No correlated Kubernetes pod failure was found in current cluster state.")
+        lines.append(msg.no_correlated_kubernetes_failure())
 
     if finding.metadata.get("has_k8s_evidence") == "true":
         if finding.metadata.get("fallback_pod_matching_used") == "true":
-            lines.append("Pod selector lookup failed; fallback pod name matching was used")
+            lines.append(msg.fallback_pod_matching_used())
         if len(lines) <= 2:
-            lines.append("No deeper Kubernetes cause was detected")
+            lines.append(msg.no_deeper_kubernetes_cause())
 
     return list(dict.fromkeys(lines))[:5]
 
@@ -237,7 +238,7 @@ def _print_kubernetes_signal(result: ScanResult, console: Console) -> None:
         return
 
     console.print()
-    console.print("[bold]Kubernetes signal:[/bold]")
+    console.print(f"[bold]{msg.SECTION_KUBERNETES_SIGNAL}:[/bold]")
     for insight in insights[:3]:
         console.print(f"- {_format_kubernetes_signal(insight)}")
 
@@ -248,7 +249,7 @@ def _print_relevant_log_excerpts(result: ScanResult, console: Console) -> None:
         return
 
     console.print()
-    console.print("[bold]Relevant log excerpts:[/bold]")
+    console.print(f"[bold]{msg.SECTION_RELEVANT_LOG_EXCERPTS}:[/bold]")
     for excerpt in excerpts[:3]:
         pod_ref = f"pod/{excerpt.pod_name}"
         source = excerpt.source.replace("_", " ")
@@ -258,7 +259,7 @@ def _print_relevant_log_excerpts(result: ScanResult, console: Console) -> None:
             console.print(f"- [{excerpt.label}] {pod_ref} {source}: {excerpt.message}")
     if len([excerpt for excerpt in excerpts if excerpt.score > 0]) > 3:
         console.print()
-        console.print("[bold]More log excerpts saved to:[/bold]")
+        console.print(f"[bold]{msg.SECTION_MORE_LOG_EXCERPTS}:[/bold]")
         console.print(f"{result.raw_evidence_dir or '.jeffrey'}/")
 
 
@@ -268,7 +269,7 @@ def _print_jeffrey_conclusion(result: ScanResult, console: Console) -> None:
         return
 
     console.print()
-    console.print("[bold]Jeffrey conclusion:[/bold]")
+    console.print(f"[bold]{msg.SECTION_JEFFREY_CONCLUSION}:[/bold]")
     for line in _jeffrey_conclusion_lines(result):
         console.print(f"- {line}")
 
@@ -279,7 +280,7 @@ def _print_manual_follow_up(result: ScanResult, console: Console) -> None:
         return
 
     console.print()
-    console.print("[bold]Manual follow-up:[/bold]")
+    console.print(f"[bold]{msg.SECTION_MANUAL_FOLLOW_UP}:[/bold]")
     for line in follow_up:
         console.print(f"- {line}")
 
@@ -318,12 +319,12 @@ def _evidence_from_kubernetes_signals(insights: list) -> list[str]:
     lines = []
     for insight in insights[:2]:
         if insight.matched_pattern.lower() == "readiness probe failed":
-            lines.append(f"Kubernetes readiness probe failed for pod/{insight.pod_name}")
+            lines.append(msg.kubernetes_readiness_failed(insight.pod_name))
             endpoint = _readiness_endpoint_summary(insight.message)
             if endpoint:
                 lines.append(endpoint)
             continue
-        lines.append(f"Kubernetes signal: {_format_kubernetes_signal(insight)}")
+        lines.append(msg.kubernetes_signal(_format_kubernetes_signal(insight)))
     return lines
 
 
@@ -364,8 +365,8 @@ def _readiness_endpoint_summary(message: str) -> str | None:
     else:
         outcome = "failed"
     if port is None:
-        return f"Readiness endpoint {path} {outcome}"
-    return f"Readiness endpoint {path} on port {port} {outcome}"
+        return msg.readiness_endpoint(path, None, outcome)
+    return msg.readiness_endpoint(path, port, outcome)
 
 
 def _first_url(message: str):
@@ -385,15 +386,15 @@ def _jeffrey_conclusion_lines(result: ScanResult) -> list[str]:
     signals = _kubernetes_signal_insights(result)
     if signals:
         lines.append(_readiness_behavior_conclusion(signals))
-        lines.append("Jeffrey checked Kubernetes events and pod describe output.")
+        lines.append(msg.checked_kubernetes_events_and_describe())
     elif evidence is not None:
-        lines.append("Jeffrey checked Kubernetes deployment, pod and event evidence.")
+        lines.append(msg.checked_kubernetes_evidence())
 
     app_lines = _application_log_conclusion_lines(result)
     lines.extend(app_lines)
 
     if result.warnings:
-        lines.append("Current cluster state may differ from the failed build state.")
+        lines.append(msg.cluster_state_may_differ())
 
     return list(dict.fromkeys(line for line in lines if line))
 
@@ -401,12 +402,12 @@ def _jeffrey_conclusion_lines(result: ScanResult) -> list[str]:
 def _root_cause_conclusion(root_cause: str) -> str:
     lower_root = root_cause.lower()
     if "readiness" in lower_root or "not become ready" in lower_root:
-        return "The pod did not become ready during rollout."
+        return msg.readiness_conclusion()
     if "missing python module" in lower_root:
-        return "The application failed to start because a Python module was missing."
+        return msg.missing_module_conclusion()
     if "crashing" in lower_root:
-        return "One or more pods were crashing after startup."
-    return root_cause.rstrip(".") + "."
+        return msg.crashing_conclusion()
+    return msg.root_cause_conclusion(root_cause)
 
 
 def _readiness_behavior_conclusion(insights: list) -> str:
@@ -414,31 +415,28 @@ def _readiness_behavior_conclusion(insights: list) -> str:
     refused = "connection refused" in text or "refused" in text
     timed_out = "context deadline exceeded" in text or "timeout" in text
     if refused and timed_out:
-        return (
-            "Kubernetes could reach the pod IP, but the readiness endpoint did not "
-            "respond reliably."
-        )
+        return msg.readiness_endpoint_unreliable()
     if refused:
-        return "The readiness endpoint refused connections."
+        return msg.readiness_endpoint_refused()
     if timed_out:
-        return "The readiness endpoint timed out before responding."
-    return "Kubernetes reported a correlated pod readiness failure."
+        return msg.readiness_endpoint_timed_out()
+    return msg.correlated_readiness_failure()
 
 
 def _application_log_conclusion_lines(result: ScanResult) -> list[str]:
     excerpts = _relevant_log_excerpts(result)
     lines = []
     if any(excerpt.matched_pattern == "clean logs" for excerpt in excerpts):
-        lines.append("No known application startup errors were found in collected logs.")
+        lines.append(msg.no_application_startup_errors())
     if any("unavailable" in excerpt.matched_pattern for excerpt in excerpts):
-        lines.append("Application logs could not be collected.")
+        lines.append(msg.application_logs_could_not_be_collected())
     if any(
         excerpt.score > 0 and excerpt.label not in {"STACK", "WARNING"}
         for excerpt in excerpts
     ):
-        lines.append("Application logs contained known error patterns.")
+        lines.append(msg.application_logs_contained_errors())
     if any(excerpt.matched_pattern == "previous_logs unavailable" for excerpt in excerpts):
-        lines.append("Previous logs were not available.")
+        lines.append(msg.previous_logs_unavailable_conclusion())
     return lines
 
 
@@ -449,14 +447,14 @@ def _manual_follow_up_lines(result: ScanResult) -> list[str]:
 
     lines = []
     if evidence.environment is not None and not evidence.environment.kubectl_found:
-        lines.append("Run Jeffrey from a machine with kubectl access.")
+        lines.append(msg.run_with_kubectl_access())
     if not evidence.selected_pods:
-        lines.append("Check the deployment selector.")
+        lines.append(msg.check_deployment_selector())
     if any(
         excerpt.matched_pattern == "logs unavailable"
         for excerpt in _relevant_log_excerpts(result)
     ):
-        lines.append("Check pod logs manually because Kubernetes did not return logs.")
+        lines.append(msg.check_pod_logs_manually())
     return lines
 
 
@@ -472,9 +470,12 @@ def save_markdown_report(result: ScanResult, path: Path) -> None:
         "",
         f"Build: {result.build_status or result.status.upper()}",
         "",
-        f"Deployment: {metadata.get('deployment') or _successful_deployment(result) or 'Unknown'}",
+        (
+            "Deployment: "
+            f"{metadata.get('deployment') or _successful_deployment(result) or msg.UNKNOWN_VALUE}"
+        ),
         "",
-        f"Namespace: {metadata.get('namespace') or 'Unknown'}",
+        f"Namespace: {metadata.get('namespace') or msg.UNKNOWN_VALUE}",
         "",
         "## Likely root cause",
         "",
@@ -487,13 +488,13 @@ def save_markdown_report(result: ScanResult, path: Path) -> None:
     if finding is not None:
         lines.extend(f"- {item}" for item in finding.evidence)
     else:
-        lines.append("- Build finished successfully.")
+        lines.append(f"- {msg.BUILD_FINISHED_SUCCESSFULLY_EVIDENCE}")
 
     lines.extend(["", "## Executed commands", ""])
     if evidence is not None and evidence.executed_commands:
         lines.extend(f"- `{command.command_text}`" for command in evidence.executed_commands)
     else:
-        lines.append("- None")
+        lines.append(f"- {msg.NONE_VALUE}")
 
     lines.extend(["", "## Pod status", ""])
     pods_output = evidence.pods_output.stdout if evidence and evidence.pods_output else ""
@@ -510,13 +511,13 @@ def save_markdown_report(result: ScanResult, path: Path) -> None:
             lines.append("")
             lines.append(_markdown_block(result_item.stdout or result_item.stderr))
     else:
-        lines.append("- None")
+        lines.append(f"- {msg.NONE_VALUE}")
 
     lines.extend(["", "## Recommended next steps", ""])
     if finding is not None:
         lines.extend(f"{index}. {item}" for index, item in enumerate(finding.what_to_check_next, 1))
     else:
-        lines.append("1. No action required.")
+        lines.append(f"1. {msg.NO_ACTION_REQUIRED}")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -528,12 +529,12 @@ def _successful_deployment(result: ScanResult) -> str | None:
 
 
 def _yes_no(value: bool) -> str:
-    return "Yes" if value else "No"
+    return msg.YES if value else msg.NO
 
 
 def _markdown_block(text: str) -> str:
     if not text:
-        return "- Not available"
+        return f"- {msg.NOT_AVAILABLE}"
     return f"```text\n{text.rstrip()}\n```"
 
 
