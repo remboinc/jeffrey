@@ -17,6 +17,7 @@ from jeffrey.models import (
     Finding,
     JenkinsRolloutContext,
     KubernetesEvidence,
+    LogExcerpt,
     LogInsight,
     Severity,
 )
@@ -55,6 +56,34 @@ LOG_PATTERNS: tuple[tuple[str, Severity, int], ...] = (
     ("pydantic", Severity.MEDIUM, 32),
     ("gunicorn", Severity.MEDIUM, 33),
     ("failed to start", Severity.HIGH, 14),
+)
+
+LOG_EXCERPT_PATTERNS: tuple[tuple[str, str, str, int], ...] = (
+    ("panic recovered", "PANIC", "critical", 100),
+    ("panic", "PANIC", "critical", 98),
+    ("Traceback", "TRACEBACK", "critical", 98),
+    ("ModuleNotFoundError", "MODULE_NOT_FOUND", "critical", 96),
+    ("ImportError", "IMPORT_ERROR", "critical", 94),
+    ("Exception", "EXCEPTION", "error", 90),
+    ("CRITICAL", "ERROR", "error", 90),
+    ("FATAL", "ERROR", "error", 90),
+    ("OOMKilled", "ERROR", "critical", 88),
+    ("CrashLoopBackOff", "ERROR", "critical", 86),
+    ("ImagePullBackOff", "ERROR", "error", 84),
+    ("CreateContainerConfigError", "ERROR", "error", 84),
+    ("connection refused", "CONNECTION_REFUSED", "error", 82),
+    ("permission denied", "PERMISSION_DENIED", "error", 80),
+    ("no space left on device", "NO_SPACE_LEFT", "error", 80),
+    ("migration failed", "MIGRATION", "error", 78),
+    ("django.db", "DJANGO_DB", "error", 76),
+    ("gunicorn", "GUNICORN", "warning", 72),
+    ("failed to start", "ERROR", "error", 72),
+    ("timeout", "TIMEOUT", "warning", 68),
+    ("Error", "ERROR", "error", 60),
+    ("Warning", "WARNING", "warning", 40),
+)
+STACK_FRAME_PATTERN = re.compile(
+    r"(?:File \".+\", line \d+|^\s+at\s+|(?:[\w.-]+/)+[\w./-]+\([^)]*\)|\.go:\d+)",
 )
 
 
@@ -132,6 +161,7 @@ def investigate_build_log(
         )
         k8s_evidence = collector.collect(context.namespace, context.deployment)
         k8s_evidence.log_insights = analyze_log_insights(k8s_evidence)
+        k8s_evidence.log_excerpts = extract_log_excerpts(k8s_evidence)
         investigation.k8s_evidence = k8s_evidence
         _add_kubernetes_metadata(rollout_finding, k8s_evidence)
         _add_current_state_warning(investigation, rollout_finding)
@@ -293,6 +323,196 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
     return sorted(insights, key=_log_insight_rank)
 
 
+def extract_log_excerpts(evidence: KubernetesEvidence) -> list[LogExcerpt]:
+    if not evidence.selected_pods:
+        return [
+            LogExcerpt(
+                pod_name=evidence.deployment,
+                source="logs",
+                severity="info",
+                label="UNKNOWN",
+                message=(
+                    f"No pods were matched for deployment {evidence.deployment}, "
+                    "so pod logs could not be analyzed."
+                ),
+                matched_pattern="no matched pods",
+                score=0,
+            )
+        ]
+
+    excerpts: list[LogExcerpt] = []
+    for pod_name in evidence.selected_pods:
+        for source, result in (
+            ("logs", evidence.pod_logs.get(pod_name)),
+            ("previous_logs", evidence.pod_previous_logs.get(pod_name)),
+        ):
+            if result is None or not result.succeeded:
+                excerpts.append(
+                    LogExcerpt(
+                        pod_name=pod_name,
+                        source=source,
+                        severity="info",
+                        label="UNKNOWN",
+                        message=_unavailable_log_message(source, pod_name),
+                        matched_pattern=f"{source} unavailable",
+                        score=0,
+                    )
+                )
+                continue
+
+            source_excerpts = _extract_excerpts_from_text(
+                pod_name,
+                source,
+                "\n".join(part for part in (result.stdout, result.stderr) if part),
+            )
+            if source_excerpts:
+                excerpts.extend(source_excerpts)
+            elif source == "logs":
+                excerpts.append(
+                    LogExcerpt(
+                        pod_name=pod_name,
+                        source=source,
+                        severity="info",
+                        label="UNKNOWN",
+                        message=(
+                            f"Logs were collected for pod/{pod_name}, but no suspicious "
+                            "application log lines were detected."
+                        ),
+                        matched_pattern="clean logs",
+                        score=0,
+                    )
+                )
+
+    return _deduplicate_excerpts(excerpts)
+
+
+def _extract_excerpts_from_text(
+    pod_name: str,
+    source: str,
+    text: str,
+) -> list[LogExcerpt]:
+    excerpts = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        excerpt = _excerpt_from_line(pod_name, source, line, index + 1)
+        if excerpt is not None:
+            excerpts.append(excerpt)
+        if excerpt is not None and excerpt.score >= 90:
+            excerpts.extend(_supporting_excerpts(pod_name, source, lines, index))
+    return sorted(excerpts, key=_excerpt_sort_key)
+
+
+def _supporting_excerpts(
+    pod_name: str,
+    source: str,
+    lines: list[str],
+    index: int,
+) -> list[LogExcerpt]:
+    excerpts = []
+    for neighbor_index in (index - 1, index + 1):
+        if neighbor_index < 0 or neighbor_index >= len(lines):
+            continue
+        line = lines[neighbor_index]
+        if not _is_supporting_log_line(line):
+            continue
+        excerpt = _excerpt_from_line(pod_name, source, line, neighbor_index + 1)
+        if excerpt is not None:
+            excerpts.append(excerpt)
+    return excerpts
+
+
+def _is_supporting_log_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    lower_line = stripped.lower()
+    return (
+        "panic" in lower_line
+        or "recovery" in lower_line
+        or "error" in lower_line
+        or _is_stack_frame_line(stripped)
+    )
+
+
+def _excerpt_from_line(
+    pod_name: str,
+    source: str,
+    line: str,
+    line_number: int,
+) -> LogExcerpt | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    pattern = _match_log_excerpt_pattern(stripped)
+    if _is_stack_frame_line(stripped) and (
+        pattern is None or pattern[1] in {"ERROR", "WARNING"}
+    ):
+        pattern = ("stack frame", "STACK", "info", 25)
+    if pattern is None:
+        return None
+
+    matched_pattern, label, severity, score = pattern
+    return LogExcerpt(
+        pod_name=pod_name,
+        source=source,
+        severity=severity,
+        label=label,
+        message=_trim_log_message(stripped),
+        matched_pattern=matched_pattern,
+        score=score,
+        line_number=line_number,
+    )
+
+
+def _match_log_excerpt_pattern(line: str) -> tuple[str, str, str, int] | None:
+    lower_line = line.lower()
+    for pattern, label, severity, score in LOG_EXCERPT_PATTERNS:
+        if pattern.lower() in lower_line:
+            return pattern, label, severity, score
+    return None
+
+
+def _is_stack_frame_line(line: str) -> bool:
+    return STACK_FRAME_PATTERN.search(line) is not None
+
+
+def _deduplicate_excerpts(excerpts: list[LogExcerpt]) -> list[LogExcerpt]:
+    deduped = []
+    seen = set()
+    for excerpt in sorted(excerpts, key=_excerpt_sort_key):
+        key = _excerpt_dedup_key(excerpt)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(excerpt)
+    return deduped
+
+
+def _excerpt_dedup_key(excerpt: LogExcerpt) -> tuple[str, str, str]:
+    normalized = re.sub(r"\d+", "0", excerpt.message.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if excerpt.label == "STACK":
+        normalized = normalized.split("(", 1)[0]
+    return (excerpt.pod_name, excerpt.label, normalized)
+
+
+def _excerpt_sort_key(excerpt: LogExcerpt) -> tuple[int, int]:
+    source_rank = 0 if excerpt.source == "previous_logs" else 1
+    return (-excerpt.score, source_rank)
+
+
+def _trim_log_message(message: str, limit: int = 180) -> str:
+    if len(message) <= limit:
+        return message
+    return message[: limit - 3].rstrip() + "..."
+
+
+def _unavailable_log_message(source: str, pod_name: str) -> str:
+    label = "Current" if source == "logs" else "Previous"
+    return f"{label} logs were not available for pod/{pod_name}."
+
+
 def rollout_context_from_finding(finding: Finding) -> JenkinsRolloutContext | None:
     for evidence in finding.evidence:
         if evidence.startswith("Jenkins rollout command: "):
@@ -348,6 +568,8 @@ def parse_rollout_command(command: str) -> JenkinsRolloutContext | None:
 
 
 def refine_rollout_timeout(finding: Finding, evidence: KubernetesEvidence) -> None:
+    if _refine_from_log_excerpts(finding, evidence):
+        return
     if _refine_from_log_insights(finding, evidence.log_insights):
         return
 
@@ -445,6 +667,58 @@ def refine_rollout_timeout(finding: Finding, evidence: KubernetesEvidence) -> No
 
     finding.evidence.extend(_important_kubernetes_summary(evidence))
     finding.evidence = list(dict.fromkeys(finding.evidence))
+
+
+def _refine_from_log_excerpts(finding: Finding, evidence: KubernetesEvidence) -> bool:
+    actionable = [
+        excerpt
+        for excerpt in evidence.log_excerpts
+        if excerpt.score > 0 and excerpt.label not in {"STACK", "WARNING"}
+    ]
+    if not actionable:
+        return False
+
+    top_labels = {excerpt.label for excerpt in actionable[:3]}
+    has_readiness = any(
+        insight.matched_pattern.lower() == "readiness probe failed"
+        for insight in evidence.log_insights
+    )
+
+    if "PANIC" in top_labels:
+        _add_log_excerpt_evidence(finding, actionable[0])
+        if has_readiness:
+            finding.root_cause = (
+                "Deployment rollout timed out because the application did not reliably "
+                "respond to readiness checks and pod logs show panic recovery events."
+            )
+        else:
+            finding.root_cause = (
+                "Deployment rollout timed out because pod logs show application panic "
+                "recovery events."
+            )
+        return True
+    if "MODULE_NOT_FOUND" in top_labels:
+        _add_log_excerpt_evidence(finding, actionable[0])
+        finding.root_cause = (
+            "Deployment rollout timed out because the application failed to start due to "
+            "a missing Python module."
+        )
+        return True
+    if "IMPORT_ERROR" in top_labels:
+        _add_log_excerpt_evidence(finding, actionable[0])
+        finding.root_cause = (
+            "Deployment rollout timed out because the application failed to start due to "
+            "a Python import error."
+        )
+        return True
+    if "CONNECTION_REFUSED" in top_labels:
+        _add_log_excerpt_evidence(finding, actionable[0])
+        finding.root_cause = (
+            "Deployment rollout timed out because application logs show refused "
+            "connections."
+        )
+        return True
+    return False
 
 
 def _add_kubernetes_metadata(finding: Finding, evidence: KubernetesEvidence) -> None:
@@ -652,6 +926,13 @@ def _refine_from_log_insights(finding: Finding, insights: list[LogInsight]) -> b
 def _add_log_insight_evidence(finding: Finding, insight: LogInsight) -> None:
     source = insight.source.replace("_", " ")
     line = f"pod/{insight.pod_name} {source}: {insight.message}"
+    if line not in finding.evidence:
+        finding.evidence.append(line)
+
+
+def _add_log_excerpt_evidence(finding: Finding, excerpt: LogExcerpt) -> None:
+    source = excerpt.source.replace("_", " ")
+    line = f"pod/{excerpt.pod_name} {source}: {excerpt.message}"
     if line not in finding.evidence:
         finding.evidence.append(line)
 

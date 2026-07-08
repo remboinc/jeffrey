@@ -20,6 +20,17 @@ class LogInsight(BaseModel):
     matched_pattern: str
 
 
+class LogExcerpt(BaseModel):
+    pod_name: str
+    source: str
+    severity: str
+    label: str
+    message: str
+    matched_pattern: str
+    score: int
+    line_number: int | None = None
+
+
 class Finding(BaseModel):
     title: str
     severity: Severity
@@ -107,6 +118,7 @@ class KubernetesEvidence(BaseModel):
     pod_logs: dict[str, CommandResult] = Field(default_factory=dict)
     pod_previous_logs: dict[str, CommandResult] = Field(default_factory=dict)
     log_insights: list[LogInsight] = Field(default_factory=list)
+    log_excerpts: list[LogExcerpt] = Field(default_factory=list)
     command_errors: list[CommandResult] = Field(default_factory=list)
     executed_commands: list[CommandResult] = Field(default_factory=list)
     correlated_events_found: int = 0

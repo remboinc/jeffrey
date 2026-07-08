@@ -38,7 +38,7 @@ def print_report(
 
     _print_finding(likely_root_cause, result, console, heading="Likely root cause")
     _print_kubernetes_signal(result, console)
-    _print_application_log_analysis(result, console)
+    _print_relevant_log_excerpts(result, console)
     _print_jeffrey_conclusion(result, console)
     _print_manual_follow_up(result, console)
 
@@ -242,20 +242,24 @@ def _print_kubernetes_signal(result: ScanResult, console: Console) -> None:
         console.print(f"- {_format_kubernetes_signal(insight)}")
 
 
-def _print_application_log_analysis(result: ScanResult, console: Console) -> None:
-    insights = _application_log_insights(result)
-    if not insights:
+def _print_relevant_log_excerpts(result: ScanResult, console: Console) -> None:
+    excerpts = _relevant_log_excerpts(result)
+    if not excerpts:
         return
 
     console.print()
-    console.print("[bold]Application log analysis:[/bold]")
-    for insight in insights[:3]:
-        pod_ref = f"pod/{insight.pod_name}"
-        source = insight.source.replace("_", " ")
-        if insight.matched_pattern in {"clean logs", "no matched pods", "logs unavailable"}:
-            console.print(f"- {insight.message}")
+    console.print("[bold]Relevant log excerpts:[/bold]")
+    for excerpt in excerpts[:3]:
+        pod_ref = f"pod/{excerpt.pod_name}"
+        source = excerpt.source.replace("_", " ")
+        if excerpt.score <= 0:
+            console.print(f"- {excerpt.message}")
         else:
-            console.print(f"- {pod_ref} {source}: {insight.message}")
+            console.print(f"- [{excerpt.label}] {pod_ref} {source}: {excerpt.message}")
+    if len([excerpt for excerpt in excerpts if excerpt.score > 0]) > 3:
+        console.print()
+        console.print("[bold]More log excerpts saved to:[/bold]")
+        console.print(f"{result.raw_evidence_dir or '.jeffrey'}/")
 
 
 def _print_jeffrey_conclusion(result: ScanResult, console: Console) -> None:
@@ -301,6 +305,13 @@ def _application_log_insights(result: ScanResult):
         for insight in evidence.log_insights
         if insight.source in {"logs", "previous_logs"}
     ]
+
+
+def _relevant_log_excerpts(result: ScanResult):
+    evidence = result.k8s_evidence
+    if evidence is None:
+        return []
+    return evidence.log_excerpts
 
 
 def _evidence_from_kubernetes_signals(insights: list) -> list[str]:
@@ -415,19 +426,18 @@ def _readiness_behavior_conclusion(insights: list) -> str:
 
 
 def _application_log_conclusion_lines(result: ScanResult) -> list[str]:
-    insights = _application_log_insights(result)
+    excerpts = _relevant_log_excerpts(result)
     lines = []
-    if any(insight.matched_pattern == "clean logs" for insight in insights):
+    if any(excerpt.matched_pattern == "clean logs" for excerpt in excerpts):
         lines.append("No known application startup errors were found in collected logs.")
-    if any(insight.matched_pattern == "logs unavailable" for insight in insights):
+    if any("unavailable" in excerpt.matched_pattern for excerpt in excerpts):
         lines.append("Application logs could not be collected.")
     if any(
-        insight.matched_pattern
-        not in {"clean logs", "logs unavailable", "previous logs unavailable"}
-        for insight in insights
+        excerpt.score > 0 and excerpt.label not in {"STACK", "WARNING"}
+        for excerpt in excerpts
     ):
         lines.append("Application logs contained known error patterns.")
-    if any(insight.matched_pattern == "previous logs unavailable" for insight in insights):
+    if any(excerpt.matched_pattern == "previous_logs unavailable" for excerpt in excerpts):
         lines.append("Previous logs were not available.")
     return lines
 
@@ -443,8 +453,8 @@ def _manual_follow_up_lines(result: ScanResult) -> list[str]:
     if not evidence.selected_pods:
         lines.append("Check the deployment selector.")
     if any(
-        insight.matched_pattern == "logs unavailable"
-        for insight in _application_log_insights(result)
+        excerpt.matched_pattern == "logs unavailable"
+        for excerpt in _relevant_log_excerpts(result)
     ):
         lines.append("Check pod logs manually because Kubernetes did not return logs.")
     return lines

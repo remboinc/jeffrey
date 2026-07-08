@@ -8,6 +8,7 @@ from rich.console import Console
 
 from jeffrey.investigation import (
     analyze_log_insights,
+    extract_log_excerpts,
     investigate_build_log,
     parse_rollout_command,
     save_raw_evidence,
@@ -179,7 +180,7 @@ def test_connection_refused_in_logs_produces_log_insight_and_refines_root_cause(
 
     assert result.likely_root_cause is not None
     assert result.likely_root_cause.root_cause == (
-        "Deployment rollout timed out because the application or dependency refused connections."
+        "Deployment rollout timed out because application logs show refused connections."
     )
     assert any(
         insight.matched_pattern == "connection refused"
@@ -197,9 +198,7 @@ def test_clean_logs_report_no_known_error_patterns(tmp_path: Path, monkeypatch) 
     console = Console(file=output, force_terminal=False)
     print_report(result, console=console)
 
-    assert "No known startup errors were found in the application logs." in _normalized_output(
-        output
-    )
+    assert "no suspicious application log lines were detected" in _normalized_output(output)
 
 
 def test_no_matched_pods_reports_logs_could_not_be_analyzed(
@@ -544,7 +543,7 @@ def test_previous_logs_unavailable_is_log_insight_not_next_step(
     print_report(result, console=console)
 
     rendered = output.getvalue()
-    assert "previous logs were not available" in rendered
+    assert "Previous logs were not available for pod/web-app-abc-123." in rendered
     assert "What to check next:" not in rendered
 
 
@@ -559,7 +558,7 @@ def test_default_output_shows_max_three_log_insights(tmp_path: Path, monkeypatch
     print_report(result, console=console)
 
     rendered = output.getvalue()
-    log_section = rendered.split("Application log analysis:", 1)[1].split(
+    log_section = rendered.split("Relevant log excerpts:", 1)[1].split(
         "Raw evidence saved to:",
         1,
     )[0]
@@ -627,13 +626,15 @@ def test_application_log_analysis_does_not_include_kubernetes_signal_lines(
     print_report(result, console=console)
 
     rendered = output.getvalue()
-    app_section = rendered.split("Application log analysis:", 1)[1].split(
+    app_section = rendered.split("Relevant log excerpts:", 1)[1].split(
         "Jeffrey conclusion:",
         1,
     )[0]
     assert "Readiness probe failed" not in app_section
     assert "context deadline exceeded" not in app_section
-    assert "No known startup errors were found" in app_section
+    assert "no suspicious application log lines were detected" in " ".join(
+        app_section.split()
+    )
 
 
 def test_kubernetes_signal_includes_readiness_failures(tmp_path: Path, monkeypatch) -> None:
@@ -689,6 +690,182 @@ def test_readiness_context_deadline_refines_root_cause(tmp_path: Path, monkeypat
         "Deployment rollout timed out because readiness checks timed out before "
         "the application responded."
     )
+
+
+def test_panic_lines_rank_above_generic_errors() -> None:
+    evidence = _evidence_with_logs(
+        "Error: temporary backend error\npanic recovered on /service/Method\n"
+    )
+
+    excerpts = extract_log_excerpts(evidence)
+
+    assert excerpts[0].label == "PANIC"
+    assert excerpts[0].score > excerpts[1].score
+
+
+def test_module_not_found_excerpt_is_ranked_high() -> None:
+    evidence = _evidence_with_logs("Warning: retrying\nModuleNotFoundError: No module named app\n")
+
+    excerpts = extract_log_excerpts(evidence)
+
+    assert excerpts[0].label == "MODULE_NOT_FOUND"
+    assert excerpts[0].score == 96
+
+
+def test_duplicate_log_excerpts_are_removed() -> None:
+    evidence = _evidence_with_logs("Error: failed to connect\nError: failed to connect\n")
+
+    excerpts = [excerpt for excerpt in extract_log_excerpts(evidence) if excerpt.score > 0]
+
+    assert len(excerpts) == 1
+
+
+def test_default_output_shows_max_three_relevant_log_excerpts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run_with_application_logs(
+            "panic recovered on /service/A\n"
+            "Traceback most recent call last\n"
+            "ModuleNotFoundError: No module named app\n"
+            "connection refused\n"
+            "Error: extra detail\n"
+        ),
+    )
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    log_section = rendered.split("Relevant log excerpts:", 1)[1].split(
+        "Jeffrey conclusion:",
+        1,
+    )[0]
+    assert log_section.count("- [") == 3
+    assert "More log excerpts saved to:" in rendered
+
+
+def test_relevant_log_excerpts_exclude_kubernetes_sources(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run_with_readiness_signal("context deadline exceeded"),
+    )
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    log_section = output.getvalue().split("Relevant log excerpts:", 1)[1].split(
+        "Jeffrey conclusion:",
+        1,
+    )[0]
+    assert "Readiness probe failed" not in log_section
+    assert "context deadline exceeded" not in log_section
+
+
+def test_clean_logs_print_clear_excerpt_message(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_clean_logs)
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    assert "no suspicious application log lines were detected" in _normalized_output(output)
+
+
+def test_unavailable_logs_print_clear_excerpt_messages(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        if command[:3] == ["kubectl", "logs", "web-app-abc-123"]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="logs failed")
+        return _completed(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Current logs were not available for pod/web-app-abc-123." in rendered
+    assert "Previous logs were not available for pod/web-app-abc-123." in rendered
+
+
+def test_panic_excerpts_refine_root_cause(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run_with_application_logs("panic recovered on /service/Method\n"),
+    )
+
+    result = investigate_build_log(log_path)
+
+    assert result.likely_root_cause is not None
+    assert "panic recovery events" in result.likely_root_cause.root_cause
+
+
+def test_long_log_excerpts_are_trimmed(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    long_line = "Error: " + ("x" * 240)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_application_logs(long_line))
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "..." in rendered
+    assert "x" * 220 not in rendered
+
+
+def test_stack_frame_lines_rank_below_panic_lines() -> None:
+    evidence = _evidence_with_logs(
+        "go.example.com/project/pkg/http.ProcessError(...)\n"
+        "panic recovered on /service/Method\n"
+    )
+
+    excerpts = extract_log_excerpts(evidence)
+
+    assert excerpts[0].label == "PANIC"
+    assert any(excerpt.label == "STACK" and excerpt.score == 25 for excerpt in excerpts)
+
+
+def test_raw_evidence_is_still_saved_with_relevant_excerpts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run_with_application_logs("panic recovered on /service/Method\n"),
+    )
+
+    investigate_build_log(log_path)
+
+    assert (tmp_path / ".jeffrey" / "pod_web-app-abc-123_logs.txt").exists()
 
 
 def test_old_jenkins_timestamp_produces_current_state_warning(
@@ -1019,6 +1196,44 @@ def _fake_run_with_readiness_signal(reason: str):
         return _completed(command)
 
     return fake_run
+
+
+def _fake_run_with_application_logs(logs: str):
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+        if command[:3] == ["kubectl", "logs", "web-app-abc-123"]:
+            if "--previous" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr="previous logs not found",
+                )
+            return subprocess.CompletedProcess(command, 0, stdout=logs, stderr="")
+        return _completed(command)
+
+    return fake_run
+
+
+def _evidence_with_logs(logs: str) -> KubernetesEvidence:
+    return KubernetesEvidence(
+        namespace="demo",
+        deployment="web-app",
+        selected_pods=["web-app-abc-123"],
+        pod_logs={
+            "web-app-abc-123": CommandResult(
+                command=["kubectl", "logs", "web-app-abc-123"],
+                exit_code=0,
+                stdout=logs,
+            )
+        },
+        pod_previous_logs={
+            "web-app-abc-123": CommandResult(
+                command=["kubectl", "logs", "web-app-abc-123", "--previous"],
+                exit_code=1,
+                stderr="previous logs not found",
+            )
+        },
+    )
 
 
 def _fake_run_with_many_log_errors(command: list[str], **kwargs) -> subprocess.CompletedProcess:
