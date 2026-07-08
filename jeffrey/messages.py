@@ -1,5 +1,7 @@
 REPORT_TITLE = "Jeffrey investigation report"
 UNKNOWN_ROOT_CAUSE = "Jeffrey could not determine the root cause yet"
+INCOMPLETE_LOG = "Jenkins log appears incomplete or the build is still running."
+INCOMPLETE_LOG_ANALYZED = "Jeffrey analyzed the lines available so far."
 LAST_LOG_LINES_TITLE = "Last log lines"
 BUILD_SUCCESS = "Build finished successfully."
 NO_FAILURE_TO_INVESTIGATE = "There is no failure root cause to investigate."

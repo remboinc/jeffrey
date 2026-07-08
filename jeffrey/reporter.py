@@ -28,6 +28,10 @@ def print_report(
         _print_success(result, console, verbose=verbose)
         return
 
+    if result.is_incomplete and not result.has_findings:
+        _print_incomplete(result, console)
+        return
+
     if not result.has_findings:
         _print_unknown(result, console)
         return
@@ -102,7 +106,17 @@ def _print_finding(
 def _print_unknown(result: ScanResult, console: Console) -> None:
     console.print(msg.UNKNOWN_ROOT_CAUSE)
     console.print()
+    _print_last_lines(result, console)
 
+
+def _print_incomplete(result: ScanResult, console: Console) -> None:
+    console.print(msg.INCOMPLETE_LOG)
+    console.print(msg.INCOMPLETE_LOG_ANALYZED)
+    console.print()
+    _print_last_lines(result, console)
+
+
+def _print_last_lines(result: ScanResult, console: Console) -> None:
     table = Table.grid(expand=True)
     table.add_column()
     for line in result.last_lines:

@@ -137,6 +137,7 @@ class BuildInvestigation(BaseModel):
     status: str = "unknown"
     findings: list[Finding] = Field(default_factory=list)
     build_status: str | None = None
+    log_complete: bool = False
     successful_rollouts: list[SuccessfulRollout] = Field(default_factory=list)
     rollout_context: JenkinsRolloutContext | None = None
     k8s_evidence: KubernetesEvidence | None = None
@@ -152,6 +153,10 @@ class BuildInvestigation(BaseModel):
     @property
     def is_success(self) -> bool:
         return self.build_status == "SUCCESS"
+
+    @property
+    def is_incomplete(self) -> bool:
+        return not self.log_complete
 
     @property
     def likely_root_cause(self) -> Finding | None:

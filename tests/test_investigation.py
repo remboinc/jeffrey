@@ -113,6 +113,39 @@ def test_no_k8s_disables_kubernetes_investigation(tmp_path: Path, monkeypatch) -
     assert result.k8s_evidence is None
 
 
+def test_incomplete_jenkins_log_does_not_crash_or_collect_kubernetes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = tmp_path / "running.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[Pipeline] { (Deploy)",
+                f"[2026-07-06T13:36:20.261Z] + {ROLLOUT_COMMAND}",
+                'Waiting for deployment "web-app" rollout to finish...',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError("kubectl should not be called while no failure was detected")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert result.status == "running"
+    assert result.k8s_evidence is None
+    assert "Jenkins log appears incomplete" in rendered
+    assert 'Waiting for deployment "web-app" rollout to finish' in rendered
+
+
 def test_crash_loop_backoff_refines_root_cause(tmp_path: Path, monkeypatch) -> None:
     log_path = _write_failed_rollout_log(tmp_path)
     monkeypatch.chdir(tmp_path)

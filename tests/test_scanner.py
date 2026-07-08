@@ -45,6 +45,31 @@ def test_returns_unknown_result_when_no_known_pattern_exists() -> None:
     assert result.has_findings is False
     assert result.likely_root_cause is None
     assert result.is_success is False
+    assert result.status == "running"
+    assert result.log_complete is False
+
+
+def test_marks_log_complete_when_pipeline_finished_without_known_status() -> None:
+    result = scan_lines(["build started", "[Pipeline] End of Pipeline"])
+
+    assert result.status == "unknown"
+    assert result.log_complete is True
+
+
+def test_incomplete_rollout_command_does_not_create_failure() -> None:
+    result = scan_lines(
+        [
+            "[Pipeline] { (Deploy)",
+            (
+                "[2026-07-06T13:36:20.261Z] + kubectl '--namespace=demo' "
+                "rollout status deployment web-app '--timeout=150s'"
+            ),
+            'Waiting for deployment "web-app" rollout to finish...',
+        ]
+    )
+
+    assert result.status == "running"
+    assert result.has_findings is False
 
 
 def test_detects_successful_build_status_and_rollout_steps() -> None:

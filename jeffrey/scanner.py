@@ -11,6 +11,7 @@ from jeffrey.rules import RULES, Rule
 STAGE_PATTERN = re.compile(r"^\[Pipeline\]\s+\{\s+\((?P<stage>[^)]+)\)")
 COMMAND_PATTERN = re.compile(r"^(?:\[[^\]]+\]\s*)?\+\s+(?P<command>.+)$")
 FINISHED_PATTERN = re.compile(r"\bFinished:\s+(?P<status>[A-Z]+)\b")
+END_OF_PIPELINE_PATTERN = re.compile(r"\[Pipeline\]\s+End of Pipeline\b")
 SUCCESSFUL_ROLLOUT_PATTERN = re.compile(
     r'\b(?:deployment|statefulset)\s+"(?P<name>[^"]+)"\s+successfully rolled out\b',
     re.IGNORECASE,
@@ -26,6 +27,7 @@ def scan_lines(lines: Iterable[str], last_lines: int = 80) -> ScanResult:
     current_stage: str | None = None
     current_command: str | None = None
     build_status: str | None = None
+    log_complete = False
     successful_rollouts: list[SuccessfulRollout] = []
     last_log_lines: deque[str] = deque(maxlen=max(0, last_lines))
     findings_by_rule: dict[str, Finding] = {}
@@ -37,6 +39,10 @@ def scan_lines(lines: Iterable[str], last_lines: int = 80) -> ScanResult:
         finished_match = FINISHED_PATTERN.search(line)
         if finished_match:
             build_status = finished_match.group("status")
+            log_complete = True
+
+        if END_OF_PIPELINE_PATTERN.search(line):
+            log_complete = True
 
         stage_match = STAGE_PATTERN.search(line)
         if stage_match:
@@ -77,10 +83,11 @@ def scan_lines(lines: Iterable[str], last_lines: int = 80) -> ScanResult:
         key=lambda finding: (finding.rank, _stage_sort_key(finding.stage), finding.title),
     )
     return ScanResult(
-        status=_investigation_status(build_status, ranked_findings),
+        status=_investigation_status(build_status, ranked_findings, log_complete),
         findings=ranked_findings,
         last_lines=list(last_log_lines),
         build_status=build_status,
+        log_complete=log_complete,
         successful_rollouts=successful_rollouts,
     )
 
@@ -123,9 +130,15 @@ def _stage_sort_key(stage: str | None) -> str:
     return stage or ""
 
 
-def _investigation_status(build_status: str | None, findings: list[Finding]) -> str:
+def _investigation_status(
+    build_status: str | None,
+    findings: list[Finding],
+    log_complete: bool,
+) -> str:
     if build_status == "SUCCESS":
         return "success"
     if build_status == "FAILURE" or findings:
         return "failed"
+    if not log_complete:
+        return "running"
     return "unknown"
