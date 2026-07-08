@@ -210,7 +210,19 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
                 )
             )
         else:
-            insights.extend(_insights_from_result(pod_name, "logs", logs_result))
+            log_insights = _insights_from_result(pod_name, "logs", logs_result)
+            if log_insights:
+                insights.extend(log_insights)
+            else:
+                insights.append(
+                    LogInsight(
+                        pod_name=pod_name,
+                        source="logs",
+                        severity=Severity.LOW,
+                        message="No known startup errors were found in the application logs.",
+                        matched_pattern="clean logs",
+                    )
+                )
         previous_result = evidence.pod_previous_logs.get(pod_name)
         if previous_result is not None and not previous_result.succeeded:
             insights.append(
@@ -267,19 +279,11 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
                 in {"previous logs unavailable", "no correlated warning events"}
             ]
         return [
-            LogInsight(
-                pod_name=pod_name,
-                source="logs",
-                severity=Severity.LOW,
-                message="No known startup errors were found in the application logs.",
-                matched_pattern="clean logs",
-            )
-            for pod_name in evidence.selected_pods[:1]
-        ] + [
             insight
             for insight in insights
             if insight.matched_pattern
             in {
+                "clean logs",
                 "previous logs unavailable",
                 "no correlated warning events",
                 "logs unavailable",
@@ -555,10 +559,10 @@ def _log_insight_rank(insight: LogInsight) -> tuple[int, int]:
         if insight.matched_pattern.lower() == pattern.lower():
             return (rank, _source_rank(insight.source))
     low_priority = {
+        "clean logs": 89,
         "previous logs unavailable": 90,
         "no correlated warning events": 91,
         "logs unavailable": 91,
-        "clean logs": 92,
         "no matched pods": 93,
     }
     return (low_priority.get(insight.matched_pattern, 99), _source_rank(insight.source))
@@ -575,6 +579,36 @@ def _source_rank(source: str) -> int:
 
 
 def _refine_from_log_insights(finding: Finding, insights: list[LogInsight]) -> bool:
+    readiness_insights = [
+        insight
+        for insight in insights
+        if insight.matched_pattern.lower() == "readiness probe failed"
+    ]
+    if readiness_insights:
+        messages = "\n".join(insight.message.lower() for insight in readiness_insights)
+        refused = "connection refused" in messages or "refused" in messages
+        timed_out = "context deadline exceeded" in messages or "timeout" in messages
+        for insight in readiness_insights[:2]:
+            _add_log_insight_evidence(finding, insight)
+        if refused and timed_out:
+            finding.root_cause = (
+                "Deployment rollout timed out because the application did not reliably "
+                "respond to readiness checks."
+            )
+            return True
+        if refused:
+            finding.root_cause = (
+                "Deployment rollout timed out because the application was not accepting "
+                "connections on the readiness port."
+            )
+            return True
+        if timed_out:
+            finding.root_cause = (
+                "Deployment rollout timed out because readiness checks timed out before "
+                "the application responded."
+            )
+            return True
+
     for insight in sorted(insights, key=_log_insight_rank):
         pattern = insight.matched_pattern.lower()
         if pattern == "modulenotfounderror":

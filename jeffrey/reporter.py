@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.panel import Panel
@@ -34,7 +36,11 @@ def print_report(
         _print_unknown(result, console)
         return
 
-    _print_finding(likely_root_cause, console, heading="Likely root cause")
+    _print_finding(likely_root_cause, result, console, heading="Likely root cause")
+    _print_kubernetes_signal(result, console)
+    _print_application_log_analysis(result, console)
+    _print_jeffrey_conclusion(result, console)
+    _print_manual_follow_up(result, console)
 
     if result.warnings:
         console.print()
@@ -42,15 +48,13 @@ def print_report(
         for warning in result.warnings:
             console.print(warning)
 
-    _print_log_insights(result, console)
-
     other_findings = result.findings[1:]
     if show_all and other_findings:
         console.print()
         console.print("[bold]All detected findings[/bold]")
         for finding in other_findings:
             console.print()
-            _print_finding(finding, console, heading=finding.title)
+            _print_finding(finding, result, console, heading=finding.title)
     elif other_findings:
         console.print()
         console.print("[bold]Also detected:[/bold]")
@@ -64,7 +68,13 @@ def print_report(
         _print_compact_summary(result, console)
 
 
-def _print_finding(finding: Finding, console: Console, *, heading: str) -> None:
+def _print_finding(
+    finding: Finding,
+    result: ScanResult,
+    console: Console,
+    *,
+    heading: str,
+) -> None:
     console.print(f"[bold]{heading}:[/bold]")
     console.print(finding.root_cause if finding.root_cause else finding.title)
     console.print()
@@ -84,12 +94,8 @@ def _print_finding(finding: Finding, console: Console, *, heading: str) -> None:
 
     console.print()
     console.print("[bold]Evidence:[/bold]")
-    for evidence in _default_evidence_lines(finding):
+    for evidence in _default_evidence_lines(finding, result):
         console.print(f"- {evidence}")
-    console.print()
-    console.print("[bold]What to check next:[/bold]")
-    for index, item in enumerate(_default_next_steps(finding), start=1):
-        console.print(f"{index}. {item}")
 
 
 def _print_unknown(result: ScanResult, console: Console) -> None:
@@ -182,7 +188,7 @@ def _print_raw_evidence_path(result: ScanResult, console: Console) -> None:
     console.print(f"{result.raw_evidence_dir}/")
 
 
-def _default_evidence_lines(finding: Finding) -> list[str]:
+def _default_evidence_lines(finding: Finding, result: ScanResult) -> list[str]:
     lines = []
     timeout = finding.metadata.get("timeout")
     for evidence in finding.evidence:
@@ -196,51 +202,19 @@ def _default_evidence_lines(finding: Finding) -> list[str]:
             continue
         lines.append(evidence)
 
+    signals = _kubernetes_signal_insights(result)
+    if signals:
+        lines.extend(_evidence_from_kubernetes_signals(signals))
+    elif finding.metadata.get("has_k8s_evidence") == "true":
+        lines.append("No correlated Kubernetes pod failure was found in current cluster state.")
+
     if finding.metadata.get("has_k8s_evidence") == "true":
-        deployment = finding.metadata.get("deployment", "deployment")
-        if _has_correlated_failure_evidence(lines):
-            lines.append(
-                f"Correlated Kubernetes evidence was collected for deployment {deployment}"
-            )
-        else:
-            lines.append(
-                "No correlated Kubernetes pod failure was found in current cluster state."
-            )
         if finding.metadata.get("fallback_pod_matching_used") == "true":
             lines.append("Pod selector lookup failed; fallback pod name matching was used")
         if len(lines) <= 2:
             lines.append("No deeper Kubernetes cause was detected")
 
     return list(dict.fromkeys(lines))[:5]
-
-
-def _default_next_steps(finding: Finding) -> list[str]:
-    if finding.metadata.get("has_k8s_evidence") != "true":
-        return finding.what_to_check_next[:3]
-
-    next_steps = []
-    if int(finding.metadata.get("pods_checked", "0")) > 0:
-        next_steps.append("Open .jeffrey/pods.txt")
-    if finding.metadata.get("correlated_events_found", "0") != "0":
-        next_steps.append("Review correlated pod events in the report above")
-    next_steps.append("Re-run with --debug for full investigation trace")
-    return next_steps[:3]
-
-
-def _has_correlated_failure_evidence(lines: list[str]) -> bool:
-    markers = (
-        "CrashLoopBackOff",
-        "ImagePullBackOff",
-        "ErrImagePull",
-        "OOMKilled",
-        "CreateContainerConfigError",
-        "Readiness probe failed",
-        "Liveness probe failed",
-        "ModuleNotFoundError",
-        "permission denied",
-        "connection refused",
-    )
-    return any(any(marker in line for marker in markers) for line in lines)
 
 
 def _is_default_noise(evidence: str) -> bool:
@@ -257,20 +231,223 @@ def _is_default_noise(evidence: str) -> bool:
     return any(fragment in evidence for fragment in noisy_fragments)
 
 
-def _print_log_insights(result: ScanResult, console: Console) -> None:
-    evidence = result.k8s_evidence
-    if evidence is None:
+def _print_kubernetes_signal(result: ScanResult, console: Console) -> None:
+    insights = _kubernetes_signal_insights(result)
+    if not insights:
+        return
+
+    console.print()
+    console.print("[bold]Kubernetes signal:[/bold]")
+    for insight in insights[:3]:
+        console.print(f"- {_format_kubernetes_signal(insight)}")
+
+
+def _print_application_log_analysis(result: ScanResult, console: Console) -> None:
+    insights = _application_log_insights(result)
+    if not insights:
         return
 
     console.print()
     console.print("[bold]Application log analysis:[/bold]")
-    for insight in evidence.log_insights[:3]:
+    for insight in insights[:3]:
         pod_ref = f"pod/{insight.pod_name}"
         source = insight.source.replace("_", " ")
-        if insight.matched_pattern in {"clean logs", "no matched pods"}:
+        if insight.matched_pattern in {"clean logs", "no matched pods", "logs unavailable"}:
             console.print(f"- {insight.message}")
         else:
             console.print(f"- {pod_ref} {source}: {insight.message}")
+
+
+def _print_jeffrey_conclusion(result: ScanResult, console: Console) -> None:
+    finding = result.likely_root_cause
+    if finding is None:
+        return
+
+    console.print()
+    console.print("[bold]Jeffrey conclusion:[/bold]")
+    for line in _jeffrey_conclusion_lines(result):
+        console.print(f"- {line}")
+
+
+def _print_manual_follow_up(result: ScanResult, console: Console) -> None:
+    follow_up = _manual_follow_up_lines(result)
+    if not follow_up:
+        return
+
+    console.print()
+    console.print("[bold]Manual follow-up:[/bold]")
+    for line in follow_up:
+        console.print(f"- {line}")
+
+
+def _kubernetes_signal_insights(result: ScanResult):
+    evidence = result.k8s_evidence
+    if evidence is None:
+        return []
+    ignored = {"no correlated warning events"}
+    return [
+        insight
+        for insight in evidence.log_insights
+        if insight.source in {"describe", "events"} and insight.matched_pattern not in ignored
+    ]
+
+
+def _application_log_insights(result: ScanResult):
+    evidence = result.k8s_evidence
+    if evidence is None:
+        return []
+    return [
+        insight
+        for insight in evidence.log_insights
+        if insight.source in {"logs", "previous_logs"}
+    ]
+
+
+def _evidence_from_kubernetes_signals(insights: list) -> list[str]:
+    lines = []
+    for insight in insights[:2]:
+        if insight.matched_pattern.lower() == "readiness probe failed":
+            lines.append(f"Kubernetes readiness probe failed for pod/{insight.pod_name}")
+            endpoint = _readiness_endpoint_summary(insight.message)
+            if endpoint:
+                lines.append(endpoint)
+            continue
+        lines.append(f"Kubernetes signal: {_format_kubernetes_signal(insight)}")
+    return lines
+
+
+def _format_kubernetes_signal(insight) -> str:
+    message = insight.message.strip()
+    lower_message = message.lower()
+    if insight.matched_pattern.lower() == "readiness probe failed":
+        detail = _probe_failure_detail(message)
+        return f"readiness probe failed: {detail}"
+    if "crashloopbackoff" in lower_message:
+        return f"CrashLoopBackOff for pod/{insight.pod_name}"
+    return message
+
+
+def _probe_failure_detail(message: str) -> str:
+    if "context deadline exceeded" in message.lower():
+        return "context deadline exceeded"
+    if "connection refused" in message.lower() or "refused" in message.lower():
+        return "connection refused"
+    if ":" in message:
+        return message.split(":", 1)[1].strip()
+    return message
+
+
+def _readiness_endpoint_summary(message: str) -> str | None:
+    parsed_url = _first_url(message)
+    if parsed_url is None:
+        return None
+    path = parsed_url.path or "/"
+    if parsed_url.query:
+        path = f"{path}?{parsed_url.query}"
+    port = parsed_url.port
+    lower_message = message.lower()
+    if "context deadline exceeded" in lower_message:
+        outcome = "timed out"
+    elif "connection refused" in lower_message or "refused" in lower_message:
+        outcome = "refused connection"
+    else:
+        outcome = "failed"
+    if port is None:
+        return f"Readiness endpoint {path} {outcome}"
+    return f"Readiness endpoint {path} on port {port} {outcome}"
+
+
+def _first_url(message: str):
+    match = re.search(r"https?://[^\s\"]+", message)
+    if match is None:
+        return None
+    return urlparse(match.group(0))
+
+
+def _jeffrey_conclusion_lines(result: ScanResult) -> list[str]:
+    finding = result.likely_root_cause
+    evidence = result.k8s_evidence
+    if finding is None:
+        return []
+
+    lines = [_root_cause_conclusion(finding.root_cause)]
+    signals = _kubernetes_signal_insights(result)
+    if signals:
+        lines.append(_readiness_behavior_conclusion(signals))
+        lines.append("Jeffrey checked Kubernetes events and pod describe output.")
+    elif evidence is not None:
+        lines.append("Jeffrey checked Kubernetes deployment, pod and event evidence.")
+
+    app_lines = _application_log_conclusion_lines(result)
+    lines.extend(app_lines)
+
+    if result.warnings:
+        lines.append("Current cluster state may differ from the failed build state.")
+
+    return list(dict.fromkeys(line for line in lines if line))
+
+
+def _root_cause_conclusion(root_cause: str) -> str:
+    lower_root = root_cause.lower()
+    if "readiness" in lower_root or "not become ready" in lower_root:
+        return "The pod did not become ready during rollout."
+    if "missing python module" in lower_root:
+        return "The application failed to start because a Python module was missing."
+    if "crashing" in lower_root:
+        return "One or more pods were crashing after startup."
+    return root_cause.rstrip(".") + "."
+
+
+def _readiness_behavior_conclusion(insights: list) -> str:
+    text = "\n".join(insight.message.lower() for insight in insights)
+    refused = "connection refused" in text or "refused" in text
+    timed_out = "context deadline exceeded" in text or "timeout" in text
+    if refused and timed_out:
+        return (
+            "Kubernetes could reach the pod IP, but the readiness endpoint did not "
+            "respond reliably."
+        )
+    if refused:
+        return "The readiness endpoint refused connections."
+    if timed_out:
+        return "The readiness endpoint timed out before responding."
+    return "Kubernetes reported a correlated pod readiness failure."
+
+
+def _application_log_conclusion_lines(result: ScanResult) -> list[str]:
+    insights = _application_log_insights(result)
+    lines = []
+    if any(insight.matched_pattern == "clean logs" for insight in insights):
+        lines.append("No known application startup errors were found in collected logs.")
+    if any(insight.matched_pattern == "logs unavailable" for insight in insights):
+        lines.append("Application logs could not be collected.")
+    if any(
+        insight.matched_pattern
+        not in {"clean logs", "logs unavailable", "previous logs unavailable"}
+        for insight in insights
+    ):
+        lines.append("Application logs contained known error patterns.")
+    if any(insight.matched_pattern == "previous logs unavailable" for insight in insights):
+        lines.append("Previous logs were not available.")
+    return lines
+
+
+def _manual_follow_up_lines(result: ScanResult) -> list[str]:
+    evidence = result.k8s_evidence
+    if evidence is None:
+        return []
+
+    lines = []
+    if evidence.environment is not None and not evidence.environment.kubectl_found:
+        lines.append("Run Jeffrey from a machine with kubectl access.")
+    if not evidence.selected_pods:
+        lines.append("Check the deployment selector.")
+    if any(
+        insight.matched_pattern == "logs unavailable"
+        for insight in _application_log_insights(result)
+    ):
+        lines.append("Check pod logs manually because Kubernetes did not return logs.")
+    return lines
 
 
 def save_markdown_report(result: ScanResult, path: Path) -> None:

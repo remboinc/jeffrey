@@ -545,8 +545,7 @@ def test_previous_logs_unavailable_is_log_insight_not_next_step(
 
     rendered = output.getvalue()
     assert "previous logs were not available" in rendered
-    next_steps = rendered.split("What to check next:", 1)[1]
-    assert "Previous logs were not available" not in next_steps
+    assert "What to check next:" not in rendered
 
 
 def test_default_output_shows_max_three_log_insights(tmp_path: Path, monkeypatch) -> None:
@@ -588,6 +587,108 @@ def test_duplicate_generic_kubernetes_evidence_lines_are_removed(
     rendered = output.getvalue()
     assert rendered.count("No correlated Kubernetes pod failure was found") <= 1
     assert "Kubernetes evidence was collected, but no correlated pod/deployment" not in rendered
+
+
+def test_default_output_has_conclusion_without_manual_raw_evidence_steps(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_clean_logs)
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Jeffrey conclusion:" in rendered
+    assert "What to check next:" not in rendered
+    assert "Open .jeffrey" not in rendered
+    assert "Raw evidence saved to:" in rendered
+
+
+def test_application_log_analysis_does_not_include_kubernetes_signal_lines(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run_with_readiness_signal("context deadline exceeded"),
+    )
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    app_section = rendered.split("Application log analysis:", 1)[1].split(
+        "Jeffrey conclusion:",
+        1,
+    )[0]
+    assert "Readiness probe failed" not in app_section
+    assert "context deadline exceeded" not in app_section
+    assert "No known startup errors were found" in app_section
+
+
+def test_kubernetes_signal_includes_readiness_failures(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run_with_readiness_signal("context deadline exceeded"),
+    )
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Kubernetes signal:" in rendered
+    assert "readiness probe failed: context deadline exceeded" in rendered
+
+
+def test_readiness_connection_refused_refines_root_cause(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run_with_readiness_signal("connection refused"),
+    )
+
+    result = investigate_build_log(log_path)
+
+    assert result.likely_root_cause is not None
+    assert result.likely_root_cause.root_cause == (
+        "Deployment rollout timed out because the application was not accepting "
+        "connections on the readiness port."
+    )
+
+
+def test_readiness_context_deadline_refines_root_cause(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run_with_readiness_signal("context deadline exceeded"),
+    )
+
+    result = investigate_build_log(log_path)
+
+    assert result.likely_root_cause is not None
+    assert result.likely_root_cause.root_cause == (
+        "Deployment rollout timed out because readiness checks timed out before "
+        "the application responded."
+    )
 
 
 def test_old_jenkins_timestamp_produces_current_state_warning(
@@ -892,6 +993,32 @@ def _fake_run_with_clean_logs(command: list[str], **kwargs) -> subprocess.Comple
     ):
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
     return _completed(command)
+
+
+def _fake_run_with_readiness_signal(reason: str):
+    readiness_line = (
+        'Warning Unhealthy pod/web-app-abc-123 Readiness probe failed: Get '
+        f'"http://10.0.0.1:8011/status?readiness": {reason}\n'
+    )
+
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+        if command[:4] == ["kubectl", "describe", "pod", "web-app-abc-123"]:
+            return subprocess.CompletedProcess(command, 0, stdout=readiness_line, stderr="")
+        if (
+            command[:3] == ["kubectl", "get", "events"]
+            and any("involvedObject.name=web-app-abc-123" in part for part in command)
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout=readiness_line, stderr="")
+        if command[:3] == ["kubectl", "logs", "web-app-abc-123"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="Application started\n",
+                stderr="",
+            )
+        return _completed(command)
+
+    return fake_run
 
 
 def _fake_run_with_many_log_errors(command: list[str], **kwargs) -> subprocess.CompletedProcess:
