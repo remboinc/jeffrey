@@ -17,8 +17,36 @@ pipx install .
 From a Git repository:
 
 ```bash
-pipx install git+https://github.com/OWNER/REPO.git
+pipx install git+https://github.com/remboinc/jeffrey.git
 ```
+
+From a Git repository over SSH:
+
+```bash
+pipx install git+ssh://git@github.com/remboinc/jeffrey.git
+```
+
+Upgrade an existing `pipx` installation:
+
+```bash
+pipx upgrade --force jeffrey
+```
+
+If `pipx upgrade` does not pick up a Git update, reinstall from the repository:
+
+```bash
+pipx install --force git+https://github.com/remboinc/jeffrey.git
+```
+
+Check what `pipx` installed and verify the version:
+
+```bash
+pipx list
+jeffrey --version
+```
+
+When updating Jeffrey from another computer, make sure the local changes were committed and
+pushed first. `pipx` can only install code that is available from the Git repository.
 
 For local development:
 

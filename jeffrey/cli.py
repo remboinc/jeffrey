@@ -6,14 +6,31 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
+from jeffrey import __version__
 from jeffrey.investigation import investigate_build_log
 from jeffrey.reporter import print_report, save_markdown_report
 
 app = typer.Typer(help="Investigate failed CI/CD builds from local logs.")
 
 
+def version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"jeffrey {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
-def callback() -> None:
+def callback(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=version_callback,
+            is_eager=True,
+            help="Show Jeffrey version and exit.",
+        ),
+    ] = False,
+) -> None:
     """Jeffrey investigates failed CI/CD builds."""
 
 
