@@ -200,6 +200,18 @@ def job_pod_status(pod_name: str, status: str) -> str:
     return f"Job pod {pod_name} status: {status}"
 
 
+def jenkins_observed_job_incomplete() -> str:
+    return "Jenkins observed the Job as incomplete during the build."
+
+
+def current_job_pod_status_completed() -> str:
+    return "Current Job pod status is Completed."
+
+
+def current_job_state_may_differ() -> str:
+    return "Current Job/Pod state may differ from the failed build state."
+
+
 def job_pod_logs_contain(message: str) -> str:
     return f"Job pod logs contain: {message}"
 
@@ -230,8 +242,33 @@ def job_conclusion_waited(timeout: str | None) -> str:
     return "Jenkins waited for the Kubernetes Job to complete."
 
 
+def job_conclusion_waited_but_timed_out(timeout: str | None) -> str:
+    if timeout:
+        return (
+            f"Jenkins waited {timeout} for the Kubernetes Job to complete, but it "
+            "timed out during the build."
+        )
+    return "Jenkins waited for the Kubernetes Job to complete, but it timed out during the build."
+
+
 def job_pod_still_running() -> str:
     return "The Job pod is still Running."
+
+
+def job_pod_completed_now() -> str:
+    return "The Job pod is Completed now, so Kubernetes state changed after the Jenkins failure."
+
+
+def current_job_logs_clean() -> str:
+    return "Collected current logs do not show suspicious error patterns."
+
+
+def job_completed_after_timeout_explanation() -> str:
+    return (
+        "The original timeout may have been caused by the Job finishing after Jenkins "
+        "timeout, delayed completion reporting, or Jenkins waiting condition expiring "
+        "before Kubernetes observed completion."
+    )
 
 
 def job_did_not_fail_timed_out() -> str:
@@ -385,6 +422,15 @@ def possible_long_running_job() -> tuple[str, ...]:
         "Waiting for Redis/Sentinel/DB/external dependency",
         "Command blocked or stuck without emitting error logs",
         "Timeout value is too small for this operation",
+    )
+
+
+def possible_completed_after_job_timeout() -> tuple[str, ...]:
+    return (
+        "The Job completed after Jenkins had already timed out.",
+        "Kubernetes reported completion too late for the Jenkins wait timeout.",
+        "The Job was still running at timeout time but finished later.",
+        "Jenkins and current Kubernetes state are from different moments in time.",
     )
 
 

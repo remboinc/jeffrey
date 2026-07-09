@@ -489,6 +489,12 @@ def _print_job_kubernetes_signal(result: ScanResult, console: Console) -> None:
         return
     console.print()
     console.print(f"[bold]{msg.SECTION_KUBERNETES_SIGNAL}:[/bold]")
+    if _job_completed_now(result):
+        console.print(f"- {msg.jenkins_observed_job_incomplete()}")
+        console.print(f"- {msg.current_job_pod_status_completed()}")
+        console.print(f"- {msg.current_job_state_may_differ()}")
+        return
+
     console.print(f"- {msg.job_did_not_complete()}")
     console.print(f"- {msg.pods_matched(len(evidence.selected_pods))}")
     for status in list(dict.fromkeys(evidence.pod_statuses.values()))[:2]:
@@ -498,8 +504,19 @@ def _print_job_kubernetes_signal(result: ScanResult, console: Console) -> None:
 def _job_conclusion_lines(result: ScanResult) -> list[str]:
     evidence = result.job_evidence
     timeout = result.job_context.timeout if result.job_context is not None else None
-    lines = [msg.job_conclusion_waited(timeout)]
-    if evidence is not None and any(
+    completed_now = _job_completed_now(result)
+    if completed_now:
+        lines = [msg.job_conclusion_waited_but_timed_out(timeout)]
+        lines.append(msg.job_pod_completed_now())
+        if _job_logs_collected_clean(result):
+            lines.append(msg.current_job_logs_clean())
+        lines.append(msg.job_completed_after_timeout_explanation())
+    else:
+        lines = [msg.job_conclusion_waited(timeout)]
+
+    if completed_now:
+        pass
+    elif evidence is not None and any(
         status == "Running" for status in evidence.pod_statuses.values()
     ):
         lines.append(msg.job_pod_still_running())
@@ -542,11 +559,34 @@ def _has_suspicious_log_excerpts(result: ScanResult) -> bool:
 def _possible_explanations(result: ScanResult) -> tuple[str, ...]:
     if _has_strong_explicit_root_cause(result):
         return ()
+    if result.job_evidence is not None and _job_completed_now(result):
+        return msg.possible_completed_after_job_timeout()
     if result.job_evidence is not None and _job_running_with_clean_logs(result):
         return msg.possible_long_running_job()
     if result.k8s_evidence is not None and _readiness_timeout_with_clean_logs(result):
         return msg.possible_readiness_timeout()
     return ()
+
+
+def _job_completed_now(result: ScanResult) -> bool:
+    evidence = result.job_evidence
+    if evidence is None:
+        return False
+    return any(
+        _normalize_job_pod_status(status) in {"completed", "succeeded"}
+        for status in evidence.pod_statuses.values()
+    )
+
+
+def _normalize_job_pod_status(status: str) -> str:
+    return status.strip().lower()
+
+
+def _job_logs_collected_clean(result: ScanResult) -> bool:
+    evidence = result.job_evidence
+    if evidence is None:
+        return False
+    return any(excerpt.matched_pattern == "clean logs" for excerpt in evidence.log_excerpts)
 
 
 def _job_running_with_clean_logs(result: ScanResult) -> bool:

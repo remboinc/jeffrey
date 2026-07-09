@@ -359,6 +359,150 @@ def test_running_job_clean_logs_conclusion_has_possible_explanations(
     assert "Timeout value is too small for this operation" in rendered
 
 
+def test_job_timeout_completed_current_pod_produces_state_changed_conclusion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path, timestamp="2026-07-09T18:32:42Z")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(command, pod_status="Completed"),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = _normalized_output(output)
+    assert "Kubernetes Job data-job timed out before completion." in rendered
+    assert "Jenkins observed the Job as incomplete during the build." in rendered
+    assert "Current Job pod status is Completed." in rendered
+    assert "Current Job/Pod state may differ from the failed build state." in rendered
+
+    conclusion = _section(rendered, "Jeffrey conclusion:", "Possible explanations:")
+    assert (
+        "Jenkins waited 1200s for the Kubernetes Job to complete, but it timed out "
+        "during the build."
+    ) in conclusion
+    assert (
+        "The Job pod is Completed now, so Kubernetes state changed after the Jenkins failure."
+        in conclusion
+    )
+    assert "Collected current logs do not show suspicious error patterns." in conclusion
+    assert (
+        "The original timeout may have been caused by the Job finishing after Jenkins timeout"
+        in conclusion
+    )
+
+
+def test_completed_job_status_does_not_produce_running_job_conclusion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(command, pod_status="Completed"),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    conclusion = _section(
+        _normalized_output(output),
+        "Jeffrey conclusion:",
+        "Possible explanations:",
+    )
+    assert "The Job pod is still Running." not in conclusion
+    assert (
+        "The Job did not fail; it simply did not finish within the configured timeout."
+        not in conclusion
+    )
+
+
+def test_completed_job_conclusion_does_not_repeat_log_status_lines(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(command, pod_status="Completed"),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = _normalized_output(output)
+    conclusion = _section(rendered, "Jeffrey conclusion:", "Possible explanations:")
+    assert "Job pod logs were collected" in rendered
+    assert "Job pod logs were collected" not in conclusion
+    assert "Previous logs were not available" not in conclusion
+    assert "Jeffrey found the Job pod and analyzed its logs." not in conclusion
+
+
+def test_completed_job_timeout_shows_possible_explanations_and_warning(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path, timestamp="2026-07-09T18:32:42Z")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(command, pod_status="Completed"),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = _normalized_output(output)
+    assert "Possible explanations:" in rendered
+    assert "The Job completed after Jenkins had already timed out." in rendered
+    assert "Kubernetes reported completion too late for the Jenkins wait timeout." in rendered
+    assert "Jenkins and current Kubernetes state are from different moments in time." in rendered
+    assert "Warning:" in rendered
+    assert "Current Job/Pod state may differ from the failed build state." in rendered
+
+
+def test_completed_job_timeout_still_shows_clean_log_excerpt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(command, pod_status="Completed"),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = _normalized_output(output)
+    assert "Relevant log excerpts:" in rendered
+    assert (
+        "Job pod logs were collected for pod/data-job-abc, but no suspicious error "
+        "patterns were detected."
+    ) in rendered
+
+
 def test_failed_job_conclusion_says_pod_failed(tmp_path: Path, monkeypatch) -> None:
     log_path = _write_failed_job_log(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -1608,6 +1752,8 @@ def _completed_job(
             stdout = '{"items":[]}'
         else:
             phase = "Running" if pod_status == "Running" else "Failed"
+            if pod_status in {"Completed", "Succeeded"}:
+                phase = "Succeeded"
             container_state = (
                 '"state":{"running":{}}'
                 if pod_status == "Running"
