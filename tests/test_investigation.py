@@ -190,6 +190,25 @@ def test_job_report_omits_unrelated_namespace_events(tmp_path: Path, monkeypatch
     assert "other-api" not in output.getvalue()
 
 
+def test_job_default_evidence_omits_generic_collected_available_lines(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _completed_job)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    evidence = _section(output.getvalue(), "Evidence:", "Kubernetes signal:")
+    assert "collected" not in evidence
+    assert "available" not in evidence
+    assert "namespace events" not in evidence
+
+
 def test_old_job_timestamp_prints_job_state_warning(tmp_path: Path, monkeypatch) -> None:
     log_path = _write_failed_job_log(tmp_path, timestamp="2020-01-01T00:00:00.000Z")
     monkeypatch.chdir(tmp_path)
@@ -299,12 +318,15 @@ def test_no_contradictory_job_conclusion_when_logs_collected(
     print_report(result, console=console)
 
     rendered = output.getvalue()
-    assert "Jeffrey found the Job pod and analyzed its logs." in rendered
+    conclusion = _section(rendered, "Jeffrey conclusion:", "Warning:")
+    assert "Jeffrey found the Job pod and analyzed its logs." not in conclusion
     assert "Application logs could not be collected." not in rendered
     assert "Job pod logs could not be collected." not in rendered
+    assert "Job pod logs were collected" not in conclusion
+    assert "Previous logs were not available" not in conclusion
 
 
-def test_running_job_pod_conclusion_mentions_long_running_command(
+def test_running_job_clean_logs_conclusion_has_possible_explanations(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -321,10 +343,60 @@ def test_running_job_pod_conclusion_mentions_long_running_command(
     console = Console(file=output, force_terminal=False)
     print_report(result, console=console)
 
+    rendered = _normalized_output(output)
+    conclusion = _section(rendered, "Jeffrey conclusion:", "Possible explanations:")
+    assert "Jenkins waited 1200s for the Kubernetes Job to complete." in conclusion
+    assert "The Job pod is still Running." in conclusion
     assert (
-        "The Job pod is still Running, so the Job likely timed out because the command "
-        "did not finish within 1200s."
-    ) in _normalized_output(output)
+        "The Job did not fail; it simply did not finish within the configured timeout."
+        in conclusion
+    )
+    assert "Most likely, the Job command is still executing" in conclusion
+    assert "Job pod logs were collected" not in conclusion
+    assert "Previous logs were not available" not in conclusion
+    assert "Possible explanations:" in rendered
+    assert "Long-running migration or maintenance command" in rendered
+    assert "Timeout value is too small for this operation" in rendered
+
+
+def test_failed_job_conclusion_says_pod_failed(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _completed_job)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    conclusion = _section(output.getvalue(), "Jeffrey conclusion:", "Warning:")
+    assert "The Job pod failed before completion." in conclusion
+    assert "Jeffrey found the Job pod and analyzed its logs." not in conclusion
+
+
+def test_suspicious_job_logs_are_referenced_semantically_in_conclusion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(command, logs="panic recovered on /job/run\n"),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    conclusion = _section(rendered, "Jeffrey conclusion:", "Warning:")
+    assert "Job pod logs show panic recovery events." in conclusion
+    assert "The Job likely timed out because the command was unstable" in conclusion
+    assert "panic recovered on /job/run" not in conclusion
+    assert "panic recovered on /job/run" in rendered
 
 
 def test_automatically_attempts_kubernetes_investigation_when_rollout_timeout_detected(
@@ -576,7 +648,7 @@ def test_application_logs_unavailable_are_reported(tmp_path: Path, monkeypatch) 
     print_report(result, console=console)
 
     rendered = output.getvalue()
-    assert "Application logs could not be collected." in rendered
+    assert "Current logs were not available for pod/web-app-abc-123." in rendered
     assert "pod_web-app-abc-123_logs.txt" not in rendered
 
 
@@ -1673,3 +1745,12 @@ def _fake_run_with_many_log_errors(command: list[str], **kwargs) -> subprocess.C
 
 def _normalized_output(output: StringIO) -> str:
     return " ".join(output.getvalue().split())
+
+
+def _section(rendered: str, start: str, end: str) -> str:
+    if start not in rendered:
+        return ""
+    section = rendered.split(start, 1)[1]
+    if end in section:
+        section = section.split(end, 1)[0]
+    return " ".join(section.split())

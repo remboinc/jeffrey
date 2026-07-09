@@ -28,6 +28,7 @@ SECTION_KUBERNETES_SIGNAL = "Kubernetes signal"
 SECTION_RELEVANT_LOG_EXCERPTS = "Relevant log excerpts"
 SECTION_MORE_LOG_EXCERPTS = "More log excerpts saved to"
 SECTION_JEFFREY_CONCLUSION = "Jeffrey conclusion"
+SECTION_POSSIBLE_EXPLANATIONS = "Possible explanations"
 SECTION_MANUAL_FOLLOW_UP = "Manual follow-up"
 SECTION_WARNING = "Warning"
 SECTION_ALSO_DETECTED = "Also detected"
@@ -223,20 +224,52 @@ def job_conclusion_timeout() -> str:
     return "Jenkins waited for the Kubernetes Job to complete, but it timed out."
 
 
-def job_conclusion_logs_checked() -> str:
-    return "Jeffrey found the Job pod and analyzed its logs."
-
-
-def job_conclusion_running_timeout(timeout: str | None) -> str:
+def job_conclusion_waited(timeout: str | None) -> str:
     if timeout:
-        return (
-            "The Job pod is still Running, so the Job likely timed out because the "
-            f"command did not finish within {timeout}."
-        )
+        return f"Jenkins waited {timeout} for the Kubernetes Job to complete."
+    return "Jenkins waited for the Kubernetes Job to complete."
+
+
+def job_pod_still_running() -> str:
+    return "The Job pod is still Running."
+
+
+def job_did_not_fail_timed_out() -> str:
+    return "The Job did not fail; it simply did not finish within the configured timeout."
+
+
+def job_likely_running_or_blocked() -> str:
     return (
-        "The Job pod is still Running, so the Job likely timed out because the command "
-        "did not finish in time."
+        "Most likely, the Job command is still executing, blocked, or waiting for an "
+        "external dependency."
     )
+
+
+def job_pod_failed_before_completion() -> str:
+    return "The Job pod failed before completion."
+
+
+def job_log_excerpts_point_to_failure() -> str:
+    return "Relevant log excerpts above point to the likely failure reason."
+
+
+def job_logs_show_panic() -> str:
+    return "Job pod logs show panic recovery events."
+
+
+def job_panic_timeout_explanation() -> str:
+    return (
+        "The Job likely timed out because the command was unstable or repeatedly "
+        "recovering from runtime errors."
+    )
+
+
+def job_logs_show_refused_connections() -> str:
+    return "Job pod logs show refused connections."
+
+
+def job_dependency_unavailable() -> str:
+    return "The Job may be waiting for a dependency that is unavailable."
 
 
 def current_job_state_warning(failed_at: str) -> str:
@@ -344,6 +377,24 @@ def application_logs_contained_errors() -> str:
 
 def previous_logs_unavailable_conclusion() -> str:
     return "Previous logs were not available."
+
+
+def possible_long_running_job() -> tuple[str, ...]:
+    return (
+        "Long-running migration or maintenance command",
+        "Waiting for Redis/Sentinel/DB/external dependency",
+        "Command blocked or stuck without emitting error logs",
+        "Timeout value is too small for this operation",
+    )
+
+
+def possible_readiness_timeout() -> tuple[str, ...]:
+    return (
+        "Application startup takes longer than readiness timeout",
+        "Application is listening on the wrong port",
+        "Readiness endpoint is blocked or slow",
+        "Dependency check inside readiness endpoint is hanging",
+    )
 
 
 def run_with_kubectl_access() -> str:

@@ -45,6 +45,7 @@ def print_report(
     _print_kubernetes_signal(result, console)
     _print_relevant_log_excerpts(result, console)
     _print_jeffrey_conclusion(result, console)
+    _print_possible_explanations(result, console)
     _print_manual_follow_up(result, console)
 
     if result.warnings:
@@ -296,6 +297,17 @@ def _print_jeffrey_conclusion(result: ScanResult, console: Console) -> None:
         console.print(f"- {line}")
 
 
+def _print_possible_explanations(result: ScanResult, console: Console) -> None:
+    explanations = _possible_explanations(result)
+    if not explanations:
+        return
+
+    console.print()
+    console.print(f"[bold]{msg.SECTION_POSSIBLE_EXPLANATIONS}:[/bold]")
+    for line in explanations:
+        console.print(f"- {line}")
+
+
 def _print_manual_follow_up(result: ScanResult, console: Console) -> None:
     follow_up = _manual_follow_up_lines(result)
     if not follow_up:
@@ -402,7 +414,6 @@ def _first_url(message: str):
 
 def _jeffrey_conclusion_lines(result: ScanResult) -> list[str]:
     finding = result.likely_root_cause
-    evidence = result.k8s_evidence
     if finding is None:
         return []
     if result.job_evidence is not None:
@@ -412,12 +423,6 @@ def _jeffrey_conclusion_lines(result: ScanResult) -> list[str]:
     signals = _kubernetes_signal_insights(result)
     if signals:
         lines.append(_readiness_behavior_conclusion(signals))
-        lines.append(msg.checked_kubernetes_events_and_describe())
-    elif evidence is not None:
-        lines.append(msg.checked_kubernetes_evidence())
-
-    app_lines = _application_log_conclusion_lines(result)
-    lines.extend(app_lines)
 
     if result.warnings:
         lines.append(msg.cluster_state_may_differ())
@@ -447,23 +452,6 @@ def _readiness_behavior_conclusion(insights: list) -> str:
     if timed_out:
         return msg.readiness_endpoint_timed_out()
     return msg.correlated_readiness_failure()
-
-
-def _application_log_conclusion_lines(result: ScanResult) -> list[str]:
-    excerpts = _relevant_log_excerpts(result)
-    lines = []
-    if any(excerpt.matched_pattern == "clean logs" for excerpt in excerpts):
-        lines.append(msg.no_application_startup_errors())
-    if any(excerpt.matched_pattern == "logs unavailable" for excerpt in excerpts):
-        lines.append(msg.application_logs_could_not_be_collected())
-    if any(
-        excerpt.score > 0 and excerpt.label not in {"STACK", "WARNING"}
-        for excerpt in excerpts
-    ):
-        lines.append(msg.application_logs_contained_errors())
-    if any(excerpt.matched_pattern == "previous_logs unavailable" for excerpt in excerpts):
-        lines.append(msg.previous_logs_unavailable_conclusion())
-    return lines
 
 
 def _manual_follow_up_lines(result: ScanResult) -> list[str]:
@@ -509,35 +497,97 @@ def _print_job_kubernetes_signal(result: ScanResult, console: Console) -> None:
 
 def _job_conclusion_lines(result: ScanResult) -> list[str]:
     evidence = result.job_evidence
-    lines = [msg.job_conclusion_timeout()]
-    if evidence is not None and evidence.selected_pods:
-        lines.append(msg.job_conclusion_logs_checked())
-        if any(status == "Running" for status in evidence.pod_statuses.values()):
-            timeout = result.job_context.timeout if result.job_context is not None else None
-            lines.append(msg.job_conclusion_running_timeout(timeout))
+    timeout = result.job_context.timeout if result.job_context is not None else None
+    lines = [msg.job_conclusion_waited(timeout)]
+    if evidence is not None and any(
+        status == "Running" for status in evidence.pod_statuses.values()
+    ):
+        lines.append(msg.job_pod_still_running())
+        lines.append(msg.job_did_not_fail_timed_out())
+        lines.append(msg.job_likely_running_or_blocked())
+    elif evidence is not None and any(
+        status in {"Failed", "Error", "CrashLoopBackOff", "OOMKilled"}
+        for status in evidence.pod_statuses.values()
+    ):
+        lines.append(msg.job_pod_failed_before_completion())
+        if _has_suspicious_log_excerpts(result):
+            lines.extend(_job_suspicious_log_conclusions(result))
+            lines.append(msg.job_log_excerpts_point_to_failure())
     elif result.job_context is not None:
         lines.append(msg.job_pod_logs_not_analyzed(result.job_context.job))
-    lines.extend(_job_log_conclusion_lines(result))
     if result.warnings:
         lines.append(msg.cluster_state_may_differ())
     return list(dict.fromkeys(line for line in lines if line))
 
 
-def _job_log_conclusion_lines(result: ScanResult) -> list[str]:
-    excerpts = _relevant_log_excerpts(result)
+def _job_suspicious_log_conclusions(result: ScanResult) -> list[str]:
     lines = []
-    if any(excerpt.matched_pattern == "clean logs" for excerpt in excerpts):
-        lines.append(msg.no_suspicious_job_log_lines(excerpts[0].pod_name))
-    if any(excerpt.matched_pattern == "logs unavailable" for excerpt in excerpts):
-        lines.append(msg.job_pod_logs_could_not_be_collected())
-    if any(
-        excerpt.score > 0 and excerpt.label not in {"STACK", "WARNING"}
-        for excerpt in excerpts
-    ):
-        lines.append(msg.application_logs_contained_errors())
-    if any(excerpt.matched_pattern == "previous_logs unavailable" for excerpt in excerpts):
-        lines.append(msg.previous_logs_unavailable_conclusion())
+    labels = {excerpt.label for excerpt in _relevant_log_excerpts(result)}
+    if "PANIC" in labels:
+        lines.append(msg.job_logs_show_panic())
+        lines.append(msg.job_panic_timeout_explanation())
+    if "CONNECTION_REFUSED" in labels:
+        lines.append(msg.job_logs_show_refused_connections())
+        lines.append(msg.job_dependency_unavailable())
     return lines
+
+
+def _has_suspicious_log_excerpts(result: ScanResult) -> bool:
+    return any(
+        excerpt.score > 0 and excerpt.label not in {"STACK", "WARNING"}
+        for excerpt in _relevant_log_excerpts(result)
+    )
+
+
+def _possible_explanations(result: ScanResult) -> tuple[str, ...]:
+    if _has_strong_explicit_root_cause(result):
+        return ()
+    if result.job_evidence is not None and _job_running_with_clean_logs(result):
+        return msg.possible_long_running_job()
+    if result.k8s_evidence is not None and _readiness_timeout_with_clean_logs(result):
+        return msg.possible_readiness_timeout()
+    return ()
+
+
+def _job_running_with_clean_logs(result: ScanResult) -> bool:
+    evidence = result.job_evidence
+    if evidence is None:
+        return False
+    return (
+        any(status == "Running" for status in evidence.pod_statuses.values())
+        and any(excerpt.matched_pattern == "clean logs" for excerpt in evidence.log_excerpts)
+        and not _has_suspicious_log_excerpts(result)
+    )
+
+
+def _readiness_timeout_with_clean_logs(result: ScanResult) -> bool:
+    return (
+        bool(_kubernetes_signal_insights(result))
+        and any(
+            excerpt.matched_pattern == "clean logs"
+            for excerpt in _relevant_log_excerpts(result)
+        )
+        and not _has_suspicious_log_excerpts(result)
+    )
+
+
+def _has_strong_explicit_root_cause(result: ScanResult) -> bool:
+    finding = result.likely_root_cause
+    if finding is None:
+        return False
+    strong_markers = (
+        "ModuleNotFoundError",
+        "ImagePullBackOff",
+        "OOMKilled",
+        "CrashLoopBackOff",
+        "permission denied",
+        "missing Python module",
+        "could not pull",
+        "memory limits",
+        "panic recovery events",
+    )
+    text = "\n".join([finding.root_cause, *finding.evidence])
+    return any(marker.lower() in text.lower() for marker in strong_markers)
 
 
 def save_markdown_report(result: ScanResult, path: Path) -> None:
