@@ -71,6 +71,32 @@ class JenkinsRolloutContext(BaseModel):
         return metadata
 
 
+class JenkinsJobContext(BaseModel):
+    namespace: str
+    job: str
+    timeout: str | None = None
+    condition: str | None = None
+    command: str
+
+    def __getitem__(self, key: str) -> str:
+        value = getattr(self, key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def to_metadata(self) -> dict[str, str]:
+        metadata = {
+            "namespace": self.namespace,
+            "job": self.job,
+            "jenkins_job_command": self.command,
+        }
+        if self.timeout is not None:
+            metadata["timeout"] = self.timeout
+        if self.condition is not None:
+            metadata["condition"] = self.condition
+        return metadata
+
+
 class CommandResult(BaseModel):
     command: list[str]
     exit_code: int | None = None
@@ -133,6 +159,37 @@ class KubernetesEvidence(BaseModel):
         return bool(self.pod_previous_logs)
 
 
+class KubernetesJobEvidence(BaseModel):
+    namespace: str
+    job: str
+    environment: EnvironmentCheck | None = None
+    job_json: CommandResult | None = None
+    job_description: CommandResult | None = None
+    selector: dict[str, str] = Field(default_factory=dict)
+    selector_text: str | None = None
+    selector_lookup_failed: bool = False
+    fallback_label_used: str | None = None
+    job_pods_json: CommandResult | None = None
+    job_pods_output: CommandResult | None = None
+    selected_pods: list[str] = Field(default_factory=list)
+    pod_statuses: dict[str, str] = Field(default_factory=dict)
+    pod_descriptions: dict[str, CommandResult] = Field(default_factory=dict)
+    pod_events: dict[str, CommandResult] = Field(default_factory=dict)
+    pod_logs: dict[str, CommandResult] = Field(default_factory=dict)
+    pod_previous_logs: dict[str, CommandResult] = Field(default_factory=dict)
+    log_excerpts: list[LogExcerpt] = Field(default_factory=list)
+    command_errors: list[CommandResult] = Field(default_factory=list)
+    executed_commands: list[CommandResult] = Field(default_factory=list)
+
+    @property
+    def pods_checked(self) -> int:
+        return len(self.pod_descriptions)
+
+    @property
+    def previous_logs_checked(self) -> bool:
+        return bool(self.pod_previous_logs)
+
+
 class BuildInvestigation(BaseModel):
     status: str = "unknown"
     findings: list[Finding] = Field(default_factory=list)
@@ -140,7 +197,9 @@ class BuildInvestigation(BaseModel):
     log_complete: bool = False
     successful_rollouts: list[SuccessfulRollout] = Field(default_factory=list)
     rollout_context: JenkinsRolloutContext | None = None
+    job_context: JenkinsJobContext | None = None
     k8s_evidence: KubernetesEvidence | None = None
+    job_evidence: KubernetesJobEvidence | None = None
     last_lines: list[str] = Field(default_factory=list)
     duration_seconds: float | None = None
     raw_evidence_dir: str | None = None

@@ -8,7 +8,12 @@ from pathlib import Path
 
 from rich.console import Console
 
-from jeffrey.models import CommandResult, EnvironmentCheck, KubernetesEvidence
+from jeffrey.models import (
+    CommandResult,
+    EnvironmentCheck,
+    KubernetesEvidence,
+    KubernetesJobEvidence,
+)
 
 DEFAULT_KUBE_TIMEOUT = 15
 MAX_PODS_TO_COLLECT = 3
@@ -190,6 +195,114 @@ class KubernetesCollector:
         )
         return evidence
 
+    def collect_job(self, namespace: str, job: str) -> KubernetesJobEvidence:
+        evidence = KubernetesJobEvidence(namespace=namespace, job=job)
+
+        evidence.environment = self.verify_environment()
+        evidence.executed_commands.extend(evidence.environment.commands)
+        for result in evidence.environment.commands:
+            self._record_error(evidence, result)
+
+        self.debug_fn("Collecting Job evidence...")
+        evidence.job_description = self._run(["kubectl", "describe", "job", job, "-n", namespace])
+        evidence.executed_commands.append(evidence.job_description)
+        self._record_error(evidence, evidence.job_description)
+
+        evidence.job_json = self._run(["kubectl", "get", "job", job, "-n", namespace, "-o", "json"])
+        evidence.executed_commands.append(evidence.job_json)
+        self._record_error(evidence, evidence.job_json)
+        evidence.selector = selector_from_job_json(evidence.job_json)
+        evidence.selector_text = selector_to_text(evidence.selector)
+
+        selected_pods: list[str] = []
+        pod_statuses: dict[str, str] = {}
+        if evidence.selector_text:
+            evidence.job_pods_json = self._run(
+                [
+                    "kubectl",
+                    "get",
+                    "pods",
+                    "-n",
+                    namespace,
+                    "-l",
+                    evidence.selector_text,
+                    "-o",
+                    "json",
+                ]
+            )
+            evidence.executed_commands.append(evidence.job_pods_json)
+            self._record_error(evidence, evidence.job_pods_json)
+            selected_pods = job_pod_names_from_json(evidence.job_pods_json)
+            pod_statuses = pod_statuses_from_json(evidence.job_pods_json)
+            evidence.selector_lookup_failed = not selected_pods
+        else:
+            evidence.selector_lookup_failed = True
+
+        for label in (f"job-name={job}", f"batch.kubernetes.io/job-name={job}"):
+            if selected_pods:
+                break
+            evidence.fallback_label_used = label
+            evidence.job_pods_json = self._run(
+                ["kubectl", "get", "pods", "-n", namespace, "-l", label, "-o", "json"]
+            )
+            evidence.executed_commands.append(evidence.job_pods_json)
+            self._record_error(evidence, evidence.job_pods_json)
+            selected_pods = job_pod_names_from_json(evidence.job_pods_json)
+            pod_statuses = pod_statuses_from_json(evidence.job_pods_json)
+
+        label_for_text = evidence.selector_text or evidence.fallback_label_used
+        if label_for_text:
+            evidence.job_pods_output = self._run(
+                ["kubectl", "get", "pods", "-n", namespace, "-l", label_for_text]
+            )
+        else:
+            evidence.job_pods_output = self._run(["kubectl", "get", "pods", "-n", namespace])
+        evidence.executed_commands.append(evidence.job_pods_output)
+        self._record_error(evidence, evidence.job_pods_output)
+
+        evidence.selected_pods = selected_pods[:MAX_PODS_TO_COLLECT]
+        evidence.pod_statuses = {
+            pod_name: pod_statuses.get(pod_name, "Unknown")
+            for pod_name in evidence.selected_pods
+        }
+
+        for pod_name in evidence.selected_pods:
+            describe_result = self._run(["kubectl", "describe", "pod", pod_name, "-n", namespace])
+            evidence.pod_descriptions[pod_name] = describe_result
+            evidence.executed_commands.append(describe_result)
+            self._record_error(evidence, describe_result)
+
+            logs_result = self._run(
+                ["kubectl", "logs", pod_name, "-n", namespace, "--tail=200"]
+            )
+            evidence.pod_logs[pod_name] = logs_result
+            evidence.executed_commands.append(logs_result)
+            self._record_error(evidence, logs_result)
+
+            previous_logs_result = self._run(
+                ["kubectl", "logs", pod_name, "-n", namespace, "--previous", "--tail=200"]
+            )
+            evidence.pod_previous_logs[pod_name] = previous_logs_result
+            evidence.executed_commands.append(previous_logs_result)
+            self._record_error(evidence, previous_logs_result)
+
+            pod_events_result = self._run(
+                [
+                    "kubectl",
+                    "get",
+                    "events",
+                    "-n",
+                    namespace,
+                    f"--field-selector=involvedObject.name={pod_name}",
+                    "--sort-by=.lastTimestamp",
+                ]
+            )
+            evidence.pod_events[pod_name] = pod_events_result
+            evidence.executed_commands.append(pod_events_result)
+            self._record_error(evidence, pod_events_result)
+
+        return evidence
+
     def verify_environment(self) -> EnvironmentCheck:
         check = EnvironmentCheck()
 
@@ -241,7 +354,10 @@ class KubernetesCollector:
         return result
 
     @staticmethod
-    def _record_error(evidence: KubernetesEvidence, result: CommandResult) -> None:
+    def _record_error(
+        evidence: KubernetesEvidence | KubernetesJobEvidence,
+        result: CommandResult,
+    ) -> None:
         if not result.succeeded:
             evidence.command_errors.append(result)
 
@@ -295,6 +411,24 @@ def selector_from_deployment_json(result: CommandResult | None) -> dict[str, str
     return {str(key): str(value) for key, value in match_labels.items()}
 
 
+def selector_from_job_json(result: CommandResult | None) -> dict[str, str]:
+    if result is None or not result.stdout:
+        return {}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+    match_labels = (
+        payload.get("spec", {})
+        .get("selector", {})
+        .get("matchLabels", {})
+    )
+    if not isinstance(match_labels, dict):
+        return {}
+    return {str(key): str(value) for key, value in match_labels.items()}
+
+
 def selector_to_text(selector: dict[str, str]) -> str | None:
     if not selector:
         return None
@@ -324,6 +458,44 @@ def pod_names_from_pods_json(
         candidates.append((_pod_status_rank(rank_status), index, str(pod_name)))
 
     return [pod_name for _, _, pod_name in sorted(candidates)[:limit]]
+
+
+def job_pod_names_from_json(
+    result: CommandResult | None,
+    *,
+    limit: int = MAX_PODS_TO_COLLECT,
+) -> list[str]:
+    if result is None or not result.stdout:
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    candidates = []
+    for index, item in enumerate(payload.get("items", [])):
+        pod_name = item.get("metadata", {}).get("name")
+        if not pod_name:
+            continue
+        status = _pod_status_from_item(item)
+        candidates.append((_pod_status_rank(status), index, str(pod_name)))
+    return [pod_name for _, _, pod_name in sorted(candidates)[:limit]]
+
+
+def pod_statuses_from_json(result: CommandResult | None) -> dict[str, str]:
+    if result is None or not result.stdout:
+        return {}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+    statuses = {}
+    for item in payload.get("items", []):
+        pod_name = item.get("metadata", {}).get("name")
+        if pod_name:
+            statuses[str(pod_name)] = _pod_status_from_item(item)
+    return statuses
 
 
 def identify_related_pods_from_json(
@@ -420,10 +592,30 @@ def _waiting_reason_from_pod_item(item: dict[str, object]) -> str | None:
     return None
 
 
+def _pod_status_from_item(item: dict[str, object]) -> str:
+    status = item.get("status", {})
+    if not isinstance(status, dict):
+        return "Unknown"
+    waiting_reason = _waiting_reason_from_pod_item(item)
+    if waiting_reason:
+        return waiting_reason
+    phase = status.get("phase")
+    if phase:
+        return str(phase)
+    return "Unknown"
+
+
 def _pod_status_rank(status: str) -> int:
     ranks = {
+        "Pending": 0,
         "Running": 0,
         "CrashLoopBackOff": 1,
         "Error": 2,
+        "Failed": 2,
+        "OOMKilled": 2,
+        "ImagePullBackOff": 2,
+        "CreateContainerConfigError": 2,
+        "Completed": 4,
+        "Succeeded": 4,
     }
     return ranks.get(status, 3)

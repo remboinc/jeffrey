@@ -16,8 +16,10 @@ from jeffrey.kubernetes import DEFAULT_KUBE_TIMEOUT, KubernetesCollector
 from jeffrey.models import (
     BuildInvestigation,
     Finding,
+    JenkinsJobContext,
     JenkinsRolloutContext,
     KubernetesEvidence,
+    KubernetesJobEvidence,
     LogExcerpt,
     LogInsight,
     Severity,
@@ -28,6 +30,13 @@ ROLLOUT_CONTEXT_PATTERN = re.compile(
     r"(?:--namespace(?:=|\s+)|-n\s+)'?(?P<namespace>[^'\s]+)'?.*?"
     r"rollout\s+status\s+deployment\s+(?P<deployment>[^\s']+).*?"
     r"(?:--timeout(?:=|\s+)'?(?P<timeout>[^'\s]+)'?)?",
+)
+JOB_CONTEXT_PATTERN = re.compile(
+    r"(?:--namespace(?:=|\s+)|-n\s+)'?(?P<namespace>[^'\s]+)'?.*?"
+    r"\bwait\b.*?"
+    r"(?:--for(?:=|\s+)'?condition=(?P<condition>[^'\s]+)'?).*?"
+    r"(?:--timeout(?:=|\s+)'?(?P<timeout>[^'\s]+)'?)?.*?"
+    r"(?:job\.batch/|jobs?/)(?P<job>[^'\s]+)",
 )
 JENKINS_TIMESTAMP_PATTERN = re.compile(r"\[(?P<timestamp>\d{4}-\d{2}-\d{2}T[^]]+Z)\]")
 
@@ -132,6 +141,28 @@ def investigate_build_log(
             return investigation
 
         rollout_finding = _rollout_timeout_finding(investigation)
+        job_finding = _job_timeout_finding(investigation)
+        if job_finding is not None and collect_k8s:
+            context = job_context_from_finding(job_finding)
+            if context is not None:
+                investigation.job_context = context
+                job_finding.metadata.update(context.to_metadata())
+                collector = collector_factory(
+                    timeout=kube_timeout,
+                    show_commands=show_commands,
+                    debug=debug,
+                    console=console,
+                )
+                job_evidence = collector.collect_job(context.namespace, context.job)
+                job_evidence.log_excerpts = extract_log_excerpts(job_evidence)
+                investigation.job_evidence = job_evidence
+                _add_job_metadata(job_finding, job_evidence)
+                refine_job_timeout(job_finding, context, job_evidence)
+                _add_current_state_warning(investigation, job_finding)
+                investigation.raw_evidence_dir = str(save_raw_evidence(None, job_evidence))
+                investigation.duration_seconds = time.monotonic() - started_at
+                return investigation
+
         if rollout_finding is None or not collect_k8s:
             investigation.duration_seconds = time.monotonic() - started_at
             return investigation
@@ -181,9 +212,42 @@ def investigate_build_log(
     return investigation
 
 
-def save_raw_evidence(evidence: KubernetesEvidence, directory: Path | None = None) -> Path:
+def save_raw_evidence(
+    evidence: KubernetesEvidence | None,
+    job_evidence: KubernetesJobEvidence | None = None,
+    directory: Path | None = None,
+) -> Path:
+    if isinstance(job_evidence, Path):
+        directory = job_evidence
+        job_evidence = None
     output_dir = directory or Path(".jeffrey")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if job_evidence is not None:
+        _write_result(output_dir / "job.json", job_evidence.job_json)
+        _write_result(output_dir / "job_describe.txt", job_evidence.job_description)
+        _write_result(output_dir / "job_pods.json", job_evidence.job_pods_json)
+        _write_result(output_dir / "job_pods.txt", job_evidence.job_pods_output)
+        for pod_name, result in job_evidence.pod_descriptions.items():
+            safe_name = _safe_filename(pod_name)
+            _write_result(output_dir / f"job_pod_{safe_name}_describe.txt", result)
+        for pod_name, result in job_evidence.pod_logs.items():
+            safe_name = _safe_filename(pod_name)
+            _write_result(output_dir / f"job_pod_{safe_name}_logs.txt", result)
+        for pod_name, result in job_evidence.pod_previous_logs.items():
+            safe_name = _safe_filename(pod_name)
+            _write_result(output_dir / f"job_pod_{safe_name}_previous_logs.txt", result)
+        for pod_name, result in job_evidence.pod_events.items():
+            safe_name = _safe_filename(pod_name)
+            _write_result(output_dir / f"job_pod_{safe_name}_events.txt", result)
+        (output_dir / "commands.txt").write_text(
+            "\n".join(result.command_text for result in job_evidence.executed_commands),
+            encoding="utf-8",
+        )
+        return output_dir
+
+    if evidence is None:
+        return output_dir
 
     _write_result(output_dir / "deployment.json", evidence.deployment_json)
     _write_result(output_dir / "deployment_describe.txt", evidence.deployment_description)
@@ -323,13 +387,14 @@ def analyze_log_insights(evidence: KubernetesEvidence) -> list[LogInsight]:
 
 def extract_log_excerpts(evidence: KubernetesEvidence) -> list[LogExcerpt]:
     if not evidence.selected_pods:
+        workload_name = getattr(evidence, "deployment", getattr(evidence, "job", "workload"))
         return [
             LogExcerpt(
-                pod_name=evidence.deployment,
+                pod_name=workload_name,
                 source="logs",
                 severity="info",
                 label="UNKNOWN",
-                message=msg.no_pods_matched(evidence.deployment),
+                message=msg.no_pods_matched(workload_name),
                 matched_pattern="no matched pods",
                 score=0,
             )
@@ -516,6 +581,21 @@ def rollout_context_from_finding(finding: Finding) -> JenkinsRolloutContext | No
     return None
 
 
+def job_context_from_finding(finding: Finding) -> JenkinsJobContext | None:
+    for evidence in finding.evidence:
+        if evidence.startswith("Jenkins job command: "):
+            command = evidence.removeprefix("Jenkins job command: ")
+        elif evidence.startswith("Command: "):
+            command = evidence.removeprefix("Command: ")
+        else:
+            continue
+
+        context = parse_job_wait_command(command)
+        if context is not None:
+            return context
+    return None
+
+
 def parse_rollout_command(command: str) -> JenkinsRolloutContext | None:
     try:
         tokens = shlex.split(command)
@@ -550,6 +630,50 @@ def parse_rollout_command(command: str) -> JenkinsRolloutContext | None:
         namespace=namespace,
         deployment=deployment,
         timeout=timeout,
+        command=command,
+    )
+
+
+def parse_job_wait_command(command: str) -> JenkinsJobContext | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return _parse_job_wait_command_with_regex(command)
+
+    namespace = None
+    job = None
+    timeout = None
+    condition = None
+
+    for index, token in enumerate(tokens):
+        if token.startswith("--namespace="):
+            namespace = token.split("=", 1)[1]
+        elif token == "--namespace" and index + 1 < len(tokens):
+            namespace = tokens[index + 1]
+        elif token == "-n" and index + 1 < len(tokens):
+            namespace = tokens[index + 1]
+        elif token.startswith("--timeout="):
+            timeout = token.split("=", 1)[1]
+        elif token == "--timeout" and index + 1 < len(tokens):
+            timeout = tokens[index + 1]
+        elif token.startswith("--for=condition="):
+            condition = token.split("=", 2)[2]
+        elif token == "--for" and index + 1 < len(tokens):
+            value = tokens[index + 1]
+            if value.startswith("condition="):
+                condition = value.split("=", 1)[1]
+        elif token.startswith("job.batch/"):
+            job = token.split("/", 1)[1]
+        elif token.startswith("jobs/"):
+            job = token.split("/", 1)[1]
+
+    if namespace is None or job is None:
+        return _parse_job_wait_command_with_regex(command)
+    return JenkinsJobContext(
+        namespace=namespace,
+        job=job,
+        timeout=timeout,
+        condition=condition,
         command=command,
     )
 
@@ -623,6 +747,41 @@ def refine_rollout_timeout(finding: Finding, evidence: KubernetesEvidence) -> No
     finding.evidence = list(dict.fromkeys(finding.evidence))
 
 
+def refine_job_timeout(
+    finding: Finding,
+    context: JenkinsJobContext,
+    evidence: KubernetesJobEvidence,
+) -> None:
+    original_evidence = list(finding.evidence)
+    finding.root_cause = f"Kubernetes Job {context.job} timed out before completion."
+    finding.evidence = [
+        msg.jenkins_job_timed_out(context.job, context.condition, context.timeout),
+    ]
+    for line in _job_error_lines(original_evidence):
+        finding.evidence.append(msg.jenkins_job_error(line))
+    for pod_name in evidence.selected_pods[:1]:
+        finding.evidence.append(
+            msg.job_pod_status(pod_name, evidence.pod_statuses.get(pod_name, "Unknown"))
+        )
+    important_excerpt = next(
+        (excerpt for excerpt in evidence.log_excerpts if excerpt.score > 0),
+        None,
+    )
+    if important_excerpt is not None:
+        finding.evidence.append(msg.job_pod_logs_contain(important_excerpt.message))
+    elif not evidence.selected_pods:
+        finding.evidence.append(msg.job_pod_logs_not_analyzed(context.job))
+    finding.evidence = list(dict.fromkeys(finding.evidence))
+
+
+def _job_error_lines(evidence_lines: list[str]) -> list[str]:
+    return [
+        line
+        for line in evidence_lines
+        if "timed out waiting for the condition" in line and not line.startswith("Jenkins")
+    ]
+
+
 def _refine_from_log_excerpts(finding: Finding, evidence: KubernetesEvidence) -> bool:
     actionable = [
         excerpt
@@ -682,6 +841,21 @@ def _add_kubernetes_metadata(finding: Finding, evidence: KubernetesEvidence) -> 
     )
 
 
+def _add_job_metadata(finding: Finding, evidence: KubernetesJobEvidence) -> None:
+    finding.metadata.update(
+        {
+            "has_job_evidence": "true",
+            "namespace": evidence.namespace,
+            "job": evidence.job,
+            "selector": evidence.selector_text or "unavailable",
+            "pods_checked": str(evidence.pods_checked),
+            "previous_logs_checked": _previous_logs_availability(evidence),
+            "executed_commands": str(len(evidence.executed_commands)),
+            "first_pod": evidence.selected_pods[0] if evidence.selected_pods else "",
+        }
+    )
+
+
 def _add_current_state_warning(
     investigation: BuildInvestigation,
     finding: Finding,
@@ -691,6 +865,11 @@ def _add_current_state_warning(
         return
     age = datetime.now(UTC) - failed_at
     if age.total_seconds() > 600:
+        if investigation.job_context is not None:
+            investigation.warnings.append(
+                msg.current_job_state_warning(failed_at.isoformat().replace("+00:00", "Z"))
+            )
+            return
         investigation.warnings.append(
             msg.current_state_warning(failed_at.isoformat().replace("+00:00", "Z"))
         )
@@ -865,6 +1044,13 @@ def _rollout_timeout_finding(investigation: BuildInvestigation) -> Finding | Non
     return None
 
 
+def _job_timeout_finding(investigation: BuildInvestigation) -> Finding | None:
+    for finding in investigation.findings:
+        if finding.title == "Kubernetes Job timed out":
+            return finding
+    return None
+
+
 def _parse_rollout_command_with_regex(command: str) -> JenkinsRolloutContext | None:
     match = ROLLOUT_CONTEXT_PATTERN.search(command)
     if match is None:
@@ -874,6 +1060,19 @@ def _parse_rollout_command_with_regex(command: str) -> JenkinsRolloutContext | N
         namespace=match.group("namespace"),
         deployment=match.group("deployment"),
         timeout=match.group("timeout"),
+        command=command,
+    )
+
+
+def _parse_job_wait_command_with_regex(command: str) -> JenkinsJobContext | None:
+    match = JOB_CONTEXT_PATTERN.search(command)
+    if match is None:
+        return None
+    return JenkinsJobContext(
+        namespace=match.group("namespace"),
+        job=match.group("job"),
+        timeout=match.group("timeout"),
+        condition=match.group("condition"),
         command=command,
     )
 

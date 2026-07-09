@@ -64,6 +64,8 @@ def scan_lines(lines: Iterable[str], last_lines: int = 80) -> ScanResult:
                 successful_rollouts.append(successful_rollout)
 
         for rule in RULES:
+            if rule.key == "rollout_timeout" and _is_job_wait_context(line, current_command):
+                continue
             if not rule.matches(line):
                 continue
 
@@ -112,12 +114,22 @@ def _finding_from_rule(
 def _evidence_for_match(line: str, command: str | None) -> list[str]:
     evidence = []
     if command is not None:
-        if "rollout status deployment" in command:
+        if " wait " in f" {command} " and ("job.batch/" in command or " jobs/" in command):
+            evidence.append(f"Jenkins job command: {command}")
+        elif "rollout status deployment" in command:
             evidence.append(f"Jenkins rollout command: {command}")
         else:
             evidence.append(f"Command: {command}")
     evidence.append(line)
     return evidence
+
+
+def _is_job_wait_context(line: str, command: str | None) -> bool:
+    if "jobs/" in line:
+        return True
+    if command is None:
+        return False
+    return " wait " in f" {command} " and "job" in command
 
 
 def _add_evidence(finding: Finding, evidence_lines: list[str]) -> None:

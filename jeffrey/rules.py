@@ -119,6 +119,22 @@ RULES: tuple[Rule, ...] = (
         rank=6,
     ),
     Rule(
+        key="job_wait_timeout",
+        pattern=re.compile(
+            r"\b(?:timed out waiting for the condition on jobs/|job\.batch/.*condition=complete)",
+            re.IGNORECASE,
+        ),
+        title="Kubernetes Job timed out",
+        severity=Severity.HIGH,
+        root_cause="Kubernetes Job timed out before reaching condition=complete.",
+        what_to_check_next=(
+            "Inspect the Job pod logs",
+            "Check Job status and backoff limit",
+            "Review pod events for scheduling or runtime failures",
+        ),
+        rank=6,
+    ),
+    Rule(
         key="rollout_timeout",
         pattern=re.compile(
             r"\b(?:timed out waiting for the condition|exceeded its progress deadline)\b",

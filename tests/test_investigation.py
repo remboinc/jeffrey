@@ -10,6 +10,7 @@ from jeffrey.investigation import (
     analyze_log_insights,
     extract_log_excerpts,
     investigate_build_log,
+    parse_job_wait_command,
     parse_rollout_command,
     save_raw_evidence,
 )
@@ -17,6 +18,10 @@ from jeffrey.models import CommandResult, KubernetesEvidence
 from jeffrey.reporter import print_report, save_markdown_report
 
 ROLLOUT_COMMAND = "kubectl '--namespace=demo' rollout status deployment web-app '--timeout=150s'"
+JOB_COMMAND = (
+    "kubectl '--namespace=demo' wait '--for=condition=complete' "
+    "'--timeout=1200s' job.batch/data-job"
+)
 
 
 def test_namespace_is_extracted_from_rollout_command() -> None:
@@ -29,6 +34,212 @@ def test_deployment_is_extracted_from_rollout_command() -> None:
 
 def test_timeout_is_extracted_from_rollout_command() -> None:
     assert parse_rollout_command(ROLLOUT_COMMAND)["timeout"] == "150s"
+
+
+def test_namespace_is_extracted_from_job_wait_command() -> None:
+    assert parse_job_wait_command(JOB_COMMAND)["namespace"] == "demo"
+
+
+def test_job_name_is_extracted_from_job_wait_command() -> None:
+    assert parse_job_wait_command(JOB_COMMAND)["job"] == "data-job"
+
+
+def test_timeout_is_extracted_from_job_wait_command() -> None:
+    assert parse_job_wait_command(JOB_COMMAND)["timeout"] == "1200s"
+
+
+def test_kubectl_wait_job_timeout_is_investigated(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return _completed_job(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert result.job_evidence is not None
+    assert result.k8s_evidence is None
+    assert result.likely_root_cause.root_cause == (
+        "Kubernetes Job data-job timed out before completion."
+    )
+    assert "Deployment rollout timed out" not in result.likely_root_cause.root_cause
+    assert "Job:" in rendered
+    assert "data-job" in rendered
+    assert ["kubectl", "describe", "job", "data-job", "-n", "demo"] in commands
+
+
+def test_job_selector_is_used_to_find_pods(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return _completed_job(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    investigate_build_log(log_path)
+
+    assert [
+        "kubectl",
+        "get",
+        "pods",
+        "-n",
+        "demo",
+        "-l",
+        "controller-uid=job-uid",
+        "-o",
+        "json",
+    ] in commands
+
+
+def test_job_name_fallback_label_is_used_if_selector_missing(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return _completed_job(command, selector=False)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.job_evidence is not None
+    assert result.job_evidence.fallback_label_used == "job-name=data-job"
+    assert [
+        "kubectl",
+        "get",
+        "pods",
+        "-n",
+        "demo",
+        "-l",
+        "job-name=data-job",
+        "-o",
+        "json",
+    ] in commands
+
+
+def test_job_pod_logs_and_previous_logs_are_collected(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return _completed_job(command, logs="Error: migration failed\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.job_evidence is not None
+    assert "data-job-abc" in result.job_evidence.pod_logs
+    assert "data-job-abc" in result.job_evidence.pod_previous_logs
+    assert ["kubectl", "logs", "data-job-abc", "-n", "demo", "--tail=200"] in commands
+    assert [
+        "kubectl",
+        "logs",
+        "data-job-abc",
+        "-n",
+        "demo",
+        "--previous",
+        "--tail=200",
+    ] in commands
+
+
+def test_job_relevant_log_excerpts_are_shown(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(command, logs="Error: migration failed\n"),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Relevant log excerpts:" in rendered
+    assert "[MIGRATION] pod/data-job-abc logs: Error: migration failed" in rendered
+
+
+def test_job_report_omits_unrelated_namespace_events(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _completed_job)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    assert "other-api" not in output.getvalue()
+
+
+def test_old_job_timestamp_prints_job_state_warning(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path, timestamp="2020-01-01T00:00:00.000Z")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _completed_job)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Current Job/Pod state may differ" in rendered
+    assert "2020-01-01T00:00:00Z" in rendered
+
+
+def test_no_job_pods_reports_logs_not_analyzed(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        if command[:4] == ["kubectl", "get", "pods", "-n"] and "-o" in command:
+            return subprocess.CompletedProcess(command, 0, stdout='{"items":[]}', stderr="")
+        return _completed_job(command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    assert "Job pod logs could not be analyzed" in output.getvalue()
+
+
+def test_job_raw_evidence_files_are_saved(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _completed_job)
+
+    investigate_build_log(log_path)
+
+    evidence_dir = tmp_path / ".jeffrey"
+    assert (evidence_dir / "job.json").exists()
+    assert (evidence_dir / "job_describe.txt").exists()
+    assert (evidence_dir / "job_pods.json").exists()
+    assert (evidence_dir / "job_pods.txt").exists()
+    assert (evidence_dir / "job_pod_data-job-abc_describe.txt").exists()
+    assert (evidence_dir / "job_pod_data-job-abc_logs.txt").exists()
+    assert (evidence_dir / "job_pod_data-job-abc_previous_logs.txt").exists()
+    assert (evidence_dir / "job_pod_data-job-abc_events.txt").exists()
 
 
 def test_automatically_attempts_kubernetes_investigation_when_rollout_timeout_detected(
@@ -1121,6 +1332,29 @@ def _write_failed_rollout_log(
     return log_path
 
 
+def _write_failed_job_log(
+    tmp_path: Path,
+    *,
+    timestamp: str = "2026-07-06T13:36:20.261Z",
+) -> Path:
+    log_path = tmp_path / "failed-job.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[Pipeline] { (Deploy)",
+                f"[{timestamp}] + {JOB_COMMAND}",
+                (
+                    f"[{timestamp}] error: timed out waiting for the condition "
+                    "on jobs/data-job"
+                ),
+                "Finished: FAILURE",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return log_path
+
+
 def _fake_run_with_signal(signal: str):
     def fake_run(command, **kwargs):
         return _completed(command, signal=signal)
@@ -1174,6 +1408,65 @@ def _completed(command: list[str], signal: str | None = None) -> subprocess.Comp
     elif command[:3] == ["kubectl", "get", "events"]:
         stdout = signal or "Normal rollout event\n"
 
+    return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+
+def _completed_job(
+    command: list[str],
+    *,
+    selector: bool = True,
+    logs: str = "job started\n",
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    stdout = ""
+    if command == ["kubectl", "config", "current-context"]:
+        stdout = "demo-cluster\n"
+    elif command[:4] == ["kubectl", "describe", "job", "data-job"]:
+        stdout = (
+            "Name: data-job\n"
+            "Completions: 1\n"
+            "Parallelism: 1\n"
+            "Pods Statuses: 0 Active / 0 Succeeded / 1 Failed\n"
+        )
+    elif command[:5] == ["kubectl", "get", "job", "data-job", "-n"]:
+        if selector:
+            stdout = (
+                '{"spec":{"selector":{"matchLabels":{"controller-uid":"job-uid"}},'
+                '"backoffLimit":6,"completions":1,"parallelism":1},'
+                '"status":{"active":0,"failed":1,"succeeded":0}}'
+            )
+        else:
+            stdout = '{"spec":{"backoffLimit":6},"status":{"failed":1}}'
+    elif (
+        command[:4] == ["kubectl", "get", "pods", "-n"]
+        and "-o" in command
+        and (
+            "controller-uid=job-uid" in command
+            or "job-name=data-job" in command
+            or "batch.kubernetes.io/job-name=data-job" in command
+        )
+    ):
+        if not selector and "controller-uid=job-uid" in command:
+            stdout = '{"items":[]}'
+        else:
+            stdout = (
+                '{"items":[{"metadata":{"name":"data-job-abc"},'
+                '"status":{"phase":"Failed",'
+                '"containerStatuses":[{"state":{"terminated":{"reason":"Error"}}}]}}]}'
+            )
+    elif command[:4] == ["kubectl", "get", "pods", "-n"]:
+        stdout = "NAME READY STATUS RESTARTS AGE\ndata-job-abc 0/1 Error 0 2m\n"
+    elif command[:4] == ["kubectl", "describe", "pod", "data-job-abc"]:
+        stdout = "Name: data-job-abc\nStatus: Failed\n"
+    elif command[:3] == ["kubectl", "logs", "data-job-abc"]:
+        stdout = "previous job log\n" if "--previous" in command else logs
+    elif (
+        command[:3] == ["kubectl", "get", "events"]
+        and any("involvedObject.name=data-job-abc" in part for part in command)
+    ):
+        stdout = "Warning BackOff pod/data-job-abc Back-off restarting failed container\n"
+    elif command[:3] == ["kubectl", "get", "events"]:
+        stdout = "Warning Unhealthy pod/other-api-123 unrelated event\n"
     return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
 

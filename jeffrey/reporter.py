@@ -87,11 +87,16 @@ def _print_finding(
     console.print(finding.stage or msg.UNKNOWN_VALUE)
 
     deployment = finding.metadata.get("deployment")
+    job = finding.metadata.get("job")
     namespace = finding.metadata.get("namespace")
     if deployment:
         console.print()
         console.print(f"[bold]{msg.SECTION_DEPLOYMENT}:[/bold]")
         console.print(deployment)
+    if job:
+        console.print()
+        console.print(f"[bold]{msg.SECTION_JOB}:[/bold]")
+        console.print(job)
     if namespace:
         console.print()
         console.print(f"[bold]{msg.SECTION_NAMESPACE}:[/bold]")
@@ -247,6 +252,9 @@ def _is_default_noise(evidence: str) -> bool:
 
 
 def _print_kubernetes_signal(result: ScanResult, console: Console) -> None:
+    if result.job_evidence is not None:
+        _print_job_kubernetes_signal(result, console)
+        return
     insights = _kubernetes_signal_insights(result)
     if not insights:
         return
@@ -323,6 +331,8 @@ def _application_log_insights(result: ScanResult):
 
 
 def _relevant_log_excerpts(result: ScanResult):
+    if result.job_evidence is not None:
+        return result.job_evidence.log_excerpts
     evidence = result.k8s_evidence
     if evidence is None:
         return []
@@ -395,6 +405,8 @@ def _jeffrey_conclusion_lines(result: ScanResult) -> list[str]:
     evidence = result.k8s_evidence
     if finding is None:
         return []
+    if result.job_evidence is not None:
+        return _job_conclusion_lines(result)
 
     lines = [_root_cause_conclusion(finding.root_cause)]
     signals = _kubernetes_signal_insights(result)
@@ -455,6 +467,17 @@ def _application_log_conclusion_lines(result: ScanResult) -> list[str]:
 
 
 def _manual_follow_up_lines(result: ScanResult) -> list[str]:
+    if result.job_evidence is not None:
+        lines = []
+        if not result.job_evidence.selected_pods:
+            lines.append(msg.check_deployment_selector())
+        if any(
+            excerpt.matched_pattern == "logs unavailable"
+            for excerpt in _relevant_log_excerpts(result)
+        ):
+            lines.append(msg.check_pod_logs_manually())
+        return lines
+
     evidence = result.k8s_evidence
     if evidence is None:
         return []
@@ -470,6 +493,31 @@ def _manual_follow_up_lines(result: ScanResult) -> list[str]:
     ):
         lines.append(msg.check_pod_logs_manually())
     return lines
+
+
+def _print_job_kubernetes_signal(result: ScanResult, console: Console) -> None:
+    evidence = result.job_evidence
+    if evidence is None:
+        return
+    console.print()
+    console.print(f"[bold]{msg.SECTION_KUBERNETES_SIGNAL}:[/bold]")
+    console.print(f"- {msg.job_did_not_complete()}")
+    console.print(f"- {msg.pods_matched(len(evidence.selected_pods))}")
+    for status in list(dict.fromkeys(evidence.pod_statuses.values()))[:2]:
+        console.print(f"- {msg.pod_status(status)}")
+
+
+def _job_conclusion_lines(result: ScanResult) -> list[str]:
+    evidence = result.job_evidence
+    lines = [msg.job_conclusion_timeout()]
+    if evidence is not None and evidence.selected_pods:
+        lines.append(msg.job_conclusion_logs_checked())
+    elif result.job_context is not None:
+        lines.append(msg.job_pod_logs_not_analyzed(result.job_context.job))
+    lines.extend(_application_log_conclusion_lines(result))
+    if result.warnings:
+        lines.append(msg.cluster_state_may_differ())
+    return list(dict.fromkeys(line for line in lines if line))
 
 
 def save_markdown_report(result: ScanResult, path: Path) -> None:

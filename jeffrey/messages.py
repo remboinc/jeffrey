@@ -9,6 +9,7 @@ NO_FAILURE_TO_INVESTIGATE = "There is no failure root cause to investigate."
 SECTION_LIKELY_ROOT_CAUSE = "Likely root cause"
 SECTION_STAGE = "Stage"
 SECTION_DEPLOYMENT = "Deployment"
+SECTION_JOB = "Job"
 SECTION_NAMESPACE = "Namespace"
 SECTION_EVIDENCE = "Evidence"
 SECTION_SUCCESSFUL_ROLLOUT_STEPS = "Successful rollout steps"
@@ -41,6 +42,7 @@ NONE_VALUE = "None"
 NOT_AVAILABLE = "Not available"
 
 ROOT_CAUSE_ROLLOUT_TIMEOUT = "Deployment rollout timed out"
+ROOT_CAUSE_JOB_TIMEOUT = "Kubernetes Job timed out before reaching condition=complete."
 ROOT_CAUSE_CRASH_LOOP = (
     "Deployment rollout timed out because one or more pods are crashing after startup."
 )
@@ -173,6 +175,56 @@ def jenkins_rollout_timed_out(timeout: str | None) -> str:
     if timeout:
         return f"Jenkins rollout command timed out after {timeout}"
     return "Jenkins rollout command timed out"
+
+
+def jenkins_job_timed_out(job: str, condition: str | None, timeout: str | None) -> str:
+    waited_for = f"condition={condition}" if condition else "the requested condition"
+    if timeout:
+        return f"Jenkins command waited for job.batch/{job} {waited_for} for {timeout}"
+    return f"Jenkins command waited for job.batch/{job} {waited_for}"
+
+
+def jenkins_job_error(line: str) -> str:
+    return f"Jenkins error: {line}"
+
+
+def job_pod_status(pod_name: str, status: str) -> str:
+    return f"Job pod {pod_name} status: {status}"
+
+
+def job_pod_logs_contain(message: str) -> str:
+    return f"Job pod logs contain: {message}"
+
+
+def job_did_not_complete() -> str:
+    return "Job did not reach Complete condition"
+
+
+def pods_matched(count: int) -> str:
+    return f"Pods matched: {count}"
+
+
+def pod_status(status: str) -> str:
+    return f"Pod status: {status}"
+
+
+def job_pod_logs_not_analyzed(job: str) -> str:
+    return f"No pods were matched for Job {job}, so Job pod logs could not be analyzed."
+
+
+def job_conclusion_timeout() -> str:
+    return "Jenkins waited for the Kubernetes Job to complete, but it timed out."
+
+
+def job_conclusion_logs_checked() -> str:
+    return "Jeffrey found the Job pod and analyzed its logs."
+
+
+def current_job_state_warning(failed_at: str) -> str:
+    return (
+        "Kubernetes is being inspected now, but the Jenkins failure happened at "
+        f"{failed_at}. Current Job/Pod state may differ from the failed build state."
+    )
 
 
 def no_correlated_kubernetes_failure() -> str:
