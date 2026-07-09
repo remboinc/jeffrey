@@ -242,6 +242,91 @@ def test_job_raw_evidence_files_are_saved(tmp_path: Path, monkeypatch) -> None:
     assert (evidence_dir / "job_pod_data-job-abc_events.txt").exists()
 
 
+def test_redis_sentinel_discovered_new_sentinel_is_not_stack() -> None:
+    evidence = _evidence_with_logs(
+        "sentinel.go:700: sentinel: discovered new sentinel at 10.0.0.1:26379\n"
+    )
+
+    excerpts = extract_log_excerpts(evidence)
+
+    assert all(excerpt.label != "STACK" for excerpt in excerpts)
+    assert excerpts[0].matched_pattern == "clean logs"
+
+
+def test_go_file_reference_alone_is_not_stack() -> None:
+    evidence = _evidence_with_logs("worker.go:42: processing item\n")
+
+    excerpts = extract_log_excerpts(evidence)
+
+    assert all(excerpt.label != "STACK" for excerpt in excerpts)
+    assert excerpts[0].matched_pattern == "clean logs"
+
+
+def test_job_info_logs_have_no_suspicious_patterns(tmp_path: Path, monkeypatch) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(
+            command,
+            logs="sentinel.go:700: sentinel: discovered new sentinel\n",
+        ),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "[STACK]" not in rendered
+    assert "Job pod logs were collected" in rendered
+    assert "no suspicious error patterns were detected" in _normalized_output(output)
+
+
+def test_no_contradictory_job_conclusion_when_logs_collected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _completed_job)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Jeffrey found the Job pod and analyzed its logs." in rendered
+    assert "Application logs could not be collected." not in rendered
+    assert "Job pod logs could not be collected." not in rendered
+
+
+def test_running_job_pod_conclusion_mentions_long_running_command(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: _completed_job(command, pod_status="Running"),
+    )
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    assert (
+        "The Job pod is still Running, so the Job likely timed out because the command "
+        "did not finish within 1200s."
+    ) in _normalized_output(output)
+
+
 def test_automatically_attempts_kubernetes_investigation_when_rollout_timeout_detected(
     tmp_path: Path,
     monkeypatch,
@@ -1416,6 +1501,7 @@ def _completed_job(
     *,
     selector: bool = True,
     logs: str = "job started\n",
+    pod_status: str = "Error",
     **kwargs,
 ) -> subprocess.CompletedProcess:
     stdout = ""
@@ -1449,15 +1535,21 @@ def _completed_job(
         if not selector and "controller-uid=job-uid" in command:
             stdout = '{"items":[]}'
         else:
+            phase = "Running" if pod_status == "Running" else "Failed"
+            container_state = (
+                '"state":{"running":{}}'
+                if pod_status == "Running"
+                else f'"state":{{"terminated":{{"reason":"{pod_status}"}}}}'
+            )
             stdout = (
                 '{"items":[{"metadata":{"name":"data-job-abc"},'
-                '"status":{"phase":"Failed",'
-                '"containerStatuses":[{"state":{"terminated":{"reason":"Error"}}}]}}]}'
+                f'"status":{{"phase":"{phase}",'
+                f'"containerStatuses":[{{{container_state}}}]}}}}]}}'
             )
     elif command[:4] == ["kubectl", "get", "pods", "-n"]:
-        stdout = "NAME READY STATUS RESTARTS AGE\ndata-job-abc 0/1 Error 0 2m\n"
+        stdout = f"NAME READY STATUS RESTARTS AGE\ndata-job-abc 0/1 {pod_status} 0 2m\n"
     elif command[:4] == ["kubectl", "describe", "pod", "data-job-abc"]:
-        stdout = "Name: data-job-abc\nStatus: Failed\n"
+        stdout = f"Name: data-job-abc\nStatus: {pod_status}\n"
     elif command[:3] == ["kubectl", "logs", "data-job-abc"]:
         stdout = "previous job log\n" if "--previous" in command else logs
     elif (

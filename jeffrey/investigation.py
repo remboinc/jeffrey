@@ -93,7 +93,7 @@ LOG_EXCERPT_PATTERNS: tuple[tuple[str, str, str, int], ...] = (
     ("Warning", "WARNING", "warning", 40),
 )
 STACK_FRAME_PATTERN = re.compile(
-    r"(?:File \".+\", line \d+|^\s+at\s+|(?:[\w.-]+/)+[\w./-]+\([^)]*\)|\.go:\d+)",
+    r"(?:File \".+\", line \d+|^\s+at\s+|(?:[\w.-]+/)+[\w./-]+\([^)]*\))",
 )
 
 
@@ -428,13 +428,18 @@ def extract_log_excerpts(evidence: KubernetesEvidence) -> list[LogExcerpt]:
             if source_excerpts:
                 excerpts.extend(source_excerpts)
             elif source == "logs":
+                clean_message = (
+                    msg.no_suspicious_job_log_lines(pod_name)
+                    if hasattr(evidence, "job")
+                    else msg.no_suspicious_log_lines(pod_name)
+                )
                 excerpts.append(
                     LogExcerpt(
                         pod_name=pod_name,
                         source=source,
                         severity="info",
                         label="UNKNOWN",
-                        message=msg.no_suspicious_log_lines(pod_name),
+                        message=clean_message,
                         matched_pattern="clean logs",
                         score=0,
                     )
@@ -555,6 +560,14 @@ def _excerpt_dedup_key(excerpt: LogExcerpt) -> tuple[str, str, str]:
 
 
 def _excerpt_sort_key(excerpt: LogExcerpt) -> tuple[int, int]:
+    if excerpt.score <= 0:
+        low_priority = {
+            "clean logs": 0,
+            "logs unavailable": 1,
+            "previous_logs unavailable": 2,
+            "no matched pods": 3,
+        }
+        return (0, low_priority.get(excerpt.matched_pattern, 9))
     source_rank = 0 if excerpt.source == "previous_logs" else 1
     return (-excerpt.score, source_rank)
 

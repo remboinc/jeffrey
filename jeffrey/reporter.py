@@ -454,7 +454,7 @@ def _application_log_conclusion_lines(result: ScanResult) -> list[str]:
     lines = []
     if any(excerpt.matched_pattern == "clean logs" for excerpt in excerpts):
         lines.append(msg.no_application_startup_errors())
-    if any("unavailable" in excerpt.matched_pattern for excerpt in excerpts):
+    if any(excerpt.matched_pattern == "logs unavailable" for excerpt in excerpts):
         lines.append(msg.application_logs_could_not_be_collected())
     if any(
         excerpt.score > 0 and excerpt.label not in {"STACK", "WARNING"}
@@ -512,12 +512,32 @@ def _job_conclusion_lines(result: ScanResult) -> list[str]:
     lines = [msg.job_conclusion_timeout()]
     if evidence is not None and evidence.selected_pods:
         lines.append(msg.job_conclusion_logs_checked())
+        if any(status == "Running" for status in evidence.pod_statuses.values()):
+            timeout = result.job_context.timeout if result.job_context is not None else None
+            lines.append(msg.job_conclusion_running_timeout(timeout))
     elif result.job_context is not None:
         lines.append(msg.job_pod_logs_not_analyzed(result.job_context.job))
-    lines.extend(_application_log_conclusion_lines(result))
+    lines.extend(_job_log_conclusion_lines(result))
     if result.warnings:
         lines.append(msg.cluster_state_may_differ())
     return list(dict.fromkeys(line for line in lines if line))
+
+
+def _job_log_conclusion_lines(result: ScanResult) -> list[str]:
+    excerpts = _relevant_log_excerpts(result)
+    lines = []
+    if any(excerpt.matched_pattern == "clean logs" for excerpt in excerpts):
+        lines.append(msg.no_suspicious_job_log_lines(excerpts[0].pod_name))
+    if any(excerpt.matched_pattern == "logs unavailable" for excerpt in excerpts):
+        lines.append(msg.job_pod_logs_could_not_be_collected())
+    if any(
+        excerpt.score > 0 and excerpt.label not in {"STACK", "WARNING"}
+        for excerpt in excerpts
+    ):
+        lines.append(msg.application_logs_contained_errors())
+    if any(excerpt.matched_pattern == "previous_logs unavailable" for excerpt in excerpts):
+        lines.append(msg.previous_logs_unavailable_conclusion())
+    return lines
 
 
 def save_markdown_report(result: ScanResult, path: Path) -> None:

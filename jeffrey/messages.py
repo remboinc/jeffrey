@@ -158,6 +158,13 @@ def no_suspicious_log_lines(pod_name: str) -> str:
     )
 
 
+def no_suspicious_job_log_lines(pod_name: str) -> str:
+    return (
+        f"Job pod logs were collected for pod/{pod_name}, but no suspicious error "
+        "patterns were detected."
+    )
+
+
 def previous_logs_not_available() -> str:
     return "previous logs were not available"
 
@@ -218,6 +225,18 @@ def job_conclusion_timeout() -> str:
 
 def job_conclusion_logs_checked() -> str:
     return "Jeffrey found the Job pod and analyzed its logs."
+
+
+def job_conclusion_running_timeout(timeout: str | None) -> str:
+    if timeout:
+        return (
+            "The Job pod is still Running, so the Job likely timed out because the "
+            f"command did not finish within {timeout}."
+        )
+    return (
+        "The Job pod is still Running, so the Job likely timed out because the command "
+        "did not finish in time."
+    )
 
 
 def current_job_state_warning(failed_at: str) -> str:
@@ -313,6 +332,10 @@ def no_application_startup_errors() -> str:
 
 def application_logs_could_not_be_collected() -> str:
     return "Application logs could not be collected."
+
+
+def job_pod_logs_could_not_be_collected() -> str:
+    return "Job pod logs could not be collected."
 
 
 def application_logs_contained_errors() -> str:
