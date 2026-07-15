@@ -118,6 +118,7 @@ class EnvironmentCheck(BaseModel):
     kubeconfig_loaded: bool = False
     current_context: str | None = None
     current_namespace: str | None = None
+    contexts: list[str] = Field(default_factory=list)
     messages: list[str] = Field(default_factory=list)
     commands: list[CommandResult] = Field(default_factory=list)
 
@@ -126,6 +127,8 @@ class KubernetesEvidence(BaseModel):
     namespace: str
     deployment: str
     environment: EnvironmentCheck | None = None
+    context: str | None = None
+    attempted_contexts: list[str] = Field(default_factory=list)
     deployment_json: CommandResult | None = None
     deployment_description: CommandResult | None = None
     selector: dict[str, str] = Field(default_factory=dict)
@@ -163,6 +166,8 @@ class KubernetesJobEvidence(BaseModel):
     namespace: str
     job: str
     environment: EnvironmentCheck | None = None
+    context: str | None = None
+    attempted_contexts: list[str] = Field(default_factory=list)
     job_json: CommandResult | None = None
     job_description: CommandResult | None = None
     selector: dict[str, str] = Field(default_factory=dict)

@@ -7,6 +7,7 @@ BUILD_SUCCESS = "Build finished successfully."
 NO_FAILURE_TO_INVESTIGATE = "There is no failure root cause to investigate."
 
 SECTION_LIKELY_ROOT_CAUSE = "Likely root cause"
+SECTION_PRIMARY_FINDING = "Primary finding"
 SECTION_STAGE = "Stage"
 SECTION_DEPLOYMENT = "Deployment"
 SECTION_JOB = "Job"
@@ -188,8 +189,8 @@ def jenkins_rollout_timed_out(timeout: str | None) -> str:
 def jenkins_job_timed_out(job: str, condition: str | None, timeout: str | None) -> str:
     waited_for = f"condition={condition}" if condition else "the requested condition"
     if timeout:
-        return f"Jenkins command waited for job.batch/{job} {waited_for} for {timeout}"
-    return f"Jenkins command waited for job.batch/{job} {waited_for}"
+        return f"Jenkins waited for job.batch/{job} {waited_for} for {timeout}"
+    return f"Jenkins waited for job.batch/{job} {waited_for}"
 
 
 def jenkins_job_error(line: str) -> str:
@@ -197,7 +198,7 @@ def jenkins_job_error(line: str) -> str:
 
 
 def job_pod_status(pod_name: str, status: str) -> str:
-    return f"Job pod {pod_name} status: {status}"
+    return f"Current Job pod {pod_name} status: {status}"
 
 
 def jenkins_observed_job_incomplete() -> str:
@@ -209,7 +210,7 @@ def current_job_pod_status_completed() -> str:
 
 
 def current_job_state_may_differ() -> str:
-    return "Current Job/Pod state may differ from the failed build state."
+    return "Current Job/Pod state changed after the Jenkins failure."
 
 
 def job_pod_logs_contain(message: str) -> str:
@@ -238,17 +239,17 @@ def job_conclusion_timeout() -> str:
 
 def job_conclusion_waited(timeout: str | None) -> str:
     if timeout:
-        return f"Jenkins waited {timeout} for the Kubernetes Job to complete."
-    return "Jenkins waited for the Kubernetes Job to complete."
+        return f"Jenkins waited {timeout} for the Job to complete."
+    return "Jenkins waited for the Job to complete."
 
 
 def job_conclusion_waited_but_timed_out(timeout: str | None) -> str:
     if timeout:
         return (
-            f"Jenkins waited {timeout} for the Kubernetes Job to complete, but it "
-            "timed out during the build."
+            f"Jenkins waited {timeout} for the Job to complete, but the wait expired "
+            "during the build."
         )
-    return "Jenkins waited for the Kubernetes Job to complete, but it timed out during the build."
+    return "Jenkins waited for the Job to complete, but the wait expired during the build."
 
 
 def job_pod_still_running() -> str:
@@ -256,18 +257,20 @@ def job_pod_still_running() -> str:
 
 
 def job_pod_completed_now() -> str:
-    return "The Job pod is Completed now, so Kubernetes state changed after the Jenkins failure."
+    return (
+        "The Job pod is Completed now, so current Kubernetes state no longer matches "
+        "the failure moment."
+    )
 
 
 def current_job_logs_clean() -> str:
-    return "Collected current logs do not show suspicious error patterns."
+    return "Current logs do not show suspicious error patterns."
 
 
 def job_completed_after_timeout_explanation() -> str:
     return (
-        "The original timeout may have been caused by the Job finishing after Jenkins "
-        "timeout, delayed completion reporting, or Jenkins waiting condition expiring "
-        "before Kubernetes observed completion."
+        "The most likely explanation is that the Job completed after Jenkins had already "
+        "timed out or Kubernetes reported completion too late for the wait command."
     )
 
 
@@ -277,8 +280,8 @@ def job_did_not_fail_timed_out() -> str:
 
 def job_likely_running_or_blocked() -> str:
     return (
-        "Most likely, the Job command is still executing, blocked, or waiting for an "
-        "external dependency."
+        "Most likely, the command is still executing, blocked, or waiting for an external "
+        "dependency."
     )
 
 

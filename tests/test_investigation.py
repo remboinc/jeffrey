@@ -130,6 +130,50 @@ def test_job_name_fallback_label_is_used_if_selector_missing(tmp_path: Path, mon
     ] in commands
 
 
+def test_job_lookup_falls_back_to_another_kubernetes_context(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_job_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if command == ["kubectl", "config", "current-context"]:
+            return subprocess.CompletedProcess(command, 0, stdout="ctx-a\n", stderr="")
+        if command == ["kubectl", "config", "get-contexts", "-o", "name"]:
+            return subprocess.CompletedProcess(command, 0, stdout="ctx-a\nctx-b\n", stderr="")
+        if command[:5] == ["kubectl", "get", "job", "data-job", "-n"]:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr='Error from server (NotFound): jobs.batch "data-job" not found',
+            )
+        return _completed_job(_strip_kubectl_context(command))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.job_evidence is not None
+    assert result.job_evidence.context == "ctx-b"
+    assert result.job_evidence.attempted_contexts == ["ctx-a", "ctx-b"]
+    assert [
+        "kubectl",
+        "--context",
+        "ctx-b",
+        "get",
+        "job",
+        "data-job",
+        "-n",
+        "demo",
+        "-o",
+        "json",
+    ] in commands
+
+
 def test_job_pod_logs_and_previous_logs_are_collected(tmp_path: Path, monkeypatch) -> None:
     log_path = _write_failed_job_log(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -344,14 +388,18 @@ def test_running_job_clean_logs_conclusion_has_possible_explanations(
     print_report(result, console=console)
 
     rendered = _normalized_output(output)
+    assert "Primary finding:" in rendered
+    assert "Likely root cause:" not in rendered
+    assert "Kubernetes Job data-job did not complete before the Jenkins timeout." in rendered
+
     conclusion = _section(rendered, "Jeffrey conclusion:", "Possible explanations:")
-    assert "Jenkins waited 1200s for the Kubernetes Job to complete." in conclusion
+    assert "Jenkins waited 1200s for the Job to complete." in conclusion
     assert "The Job pod is still Running." in conclusion
     assert (
         "The Job did not fail; it simply did not finish within the configured timeout."
         in conclusion
     )
-    assert "Most likely, the Job command is still executing" in conclusion
+    assert "Most likely, the command is still executing" in conclusion
     assert "Job pod logs were collected" not in conclusion
     assert "Previous logs were not available" not in conclusion
     assert "Possible explanations:" in rendered
@@ -377,23 +425,28 @@ def test_job_timeout_completed_current_pod_produces_state_changed_conclusion(
     print_report(result, console=console)
 
     rendered = _normalized_output(output)
-    assert "Kubernetes Job data-job timed out before completion." in rendered
+    assert "Primary finding:" in rendered
+    assert "Likely root cause:" not in rendered
+    assert "Jenkins timed out while waiting for Kubernetes Job data-job to complete." in rendered
     assert "Jenkins observed the Job as incomplete during the build." in rendered
     assert "Current Job pod status is Completed." in rendered
-    assert "Current Job/Pod state may differ from the failed build state." in rendered
+    assert "Current Job/Pod state changed after the Jenkins failure." in rendered
+    assert "Jenkins waited for job.batch/data-job condition=complete for 1200s" in rendered
 
     conclusion = _section(rendered, "Jeffrey conclusion:", "Possible explanations:")
     assert (
-        "Jenkins waited 1200s for the Kubernetes Job to complete, but it timed out "
-        "during the build."
+        "Jenkins waited 1200s for the Job to complete, but the wait expired during "
+        "the build."
     ) in conclusion
     assert (
-        "The Job pod is Completed now, so Kubernetes state changed after the Jenkins failure."
+        "The Job pod is Completed now, so current Kubernetes state no longer matches "
+        "the failure moment."
         in conclusion
     )
-    assert "Collected current logs do not show suspicious error patterns." in conclusion
+    assert "Current logs do not show suspicious error patterns." in conclusion
     assert (
-        "The original timeout may have been caused by the Job finishing after Jenkins timeout"
+        "The most likely explanation is that the Job completed after Jenkins had already "
+        "timed out"
         in conclusion
     )
 
@@ -563,6 +616,50 @@ def test_automatically_attempts_kubernetes_investigation_when_rollout_timeout_de
     assert ["kubectl", "describe", "deployment", "web-app", "-n", "demo"] in commands
 
 
+def test_deployment_lookup_falls_back_to_another_kubernetes_context(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if command == ["kubectl", "config", "current-context"]:
+            return subprocess.CompletedProcess(command, 0, stdout="ctx-a\n", stderr="")
+        if command == ["kubectl", "config", "get-contexts", "-o", "name"]:
+            return subprocess.CompletedProcess(command, 0, stdout="ctx-a\nctx-b\n", stderr="")
+        if command[:5] == ["kubectl", "get", "deployment", "web-app", "-n"]:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr='Error from server (NotFound): deployments.apps "web-app" not found',
+            )
+        return _completed(_strip_kubectl_context(command))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+
+    assert result.k8s_evidence is not None
+    assert result.k8s_evidence.context == "ctx-b"
+    assert result.k8s_evidence.attempted_contexts == ["ctx-a", "ctx-b"]
+    assert [
+        "kubectl",
+        "--context",
+        "ctx-b",
+        "get",
+        "deployment",
+        "web-app",
+        "-n",
+        "demo",
+        "-o",
+        "json",
+    ] in commands
+
+
 def test_jenkins_rollout_values_are_stored_and_reused(tmp_path: Path, monkeypatch) -> None:
     log_path = _write_failed_rollout_log(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -687,6 +784,13 @@ def test_module_not_found_in_previous_logs_refines_root_cause(tmp_path: Path, mo
         insight.matched_pattern == "ModuleNotFoundError"
         for insight in result.k8s_evidence.log_insights
     )
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+    rendered = output.getvalue()
+    assert "Likely root cause:" in rendered
+    assert "Primary finding:" not in rendered
 
 
 def test_image_pull_backoff_refines_root_cause(tmp_path: Path, monkeypatch) -> None:
@@ -1197,6 +1301,8 @@ def test_kubernetes_signal_includes_readiness_failures(tmp_path: Path, monkeypat
     print_report(result, console=console)
 
     rendered = output.getvalue()
+    assert "Likely root cause:" in rendered
+    assert "Primary finding:" not in rendered
     assert "Kubernetes signal:" in rendered
     assert "readiness probe failed: context deadline exceeded" in rendered
 
@@ -1887,6 +1993,12 @@ def _fake_run_with_many_log_errors(command: list[str], **kwargs) -> subprocess.C
             stderr="",
         )
     return _completed(command)
+
+
+def _strip_kubectl_context(command: list[str]) -> list[str]:
+    if len(command) >= 3 and command[:2] == ["kubectl", "--context"]:
+        return ["kubectl", *command[3:]]
+    return command
 
 
 def _normalized_output(output: StringIO) -> str:

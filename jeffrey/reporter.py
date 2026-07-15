@@ -41,7 +41,12 @@ def print_report(
         _print_unknown(result, console)
         return
 
-    _print_finding(likely_root_cause, result, console, heading=msg.SECTION_LIKELY_ROOT_CAUSE)
+    _print_finding(
+        likely_root_cause,
+        result,
+        console,
+        heading=_finding_heading(result),
+    )
     _print_kubernetes_signal(result, console)
     _print_relevant_log_excerpts(result, console)
     _print_jeffrey_conclusion(result, console)
@@ -82,7 +87,7 @@ def _print_finding(
     heading: str,
 ) -> None:
     console.print(f"[bold]{heading}:[/bold]")
-    console.print(finding.root_cause if finding.root_cause else finding.title)
+    console.print(_finding_summary_text(finding, result, heading))
     console.print()
     console.print(f"[bold]{msg.SECTION_STAGE}:[/bold]")
     console.print(finding.stage or msg.UNKNOWN_VALUE)
@@ -107,6 +112,31 @@ def _print_finding(
     console.print(f"[bold]{msg.SECTION_EVIDENCE}:[/bold]")
     for evidence in _default_evidence_lines(finding, result):
         console.print(f"- {evidence}")
+
+
+def _finding_heading(result: ScanResult) -> str:
+    if _has_confirmed_root_cause(result):
+        return msg.SECTION_LIKELY_ROOT_CAUSE
+    return msg.SECTION_PRIMARY_FINDING
+
+
+def _finding_summary_text(finding: Finding, result: ScanResult, heading: str) -> str:
+    if heading == msg.SECTION_LIKELY_ROOT_CAUSE:
+        return finding.root_cause if finding.root_cause else finding.title
+
+    if result.job_context is not None:
+        job = result.job_context.job
+        if _job_completed_now(result):
+            return f"Jenkins timed out while waiting for Kubernetes Job {job} to complete."
+        if _job_running_with_clean_logs(result):
+            return f"Kubernetes Job {job} did not complete before the Jenkins timeout."
+        return f"Jenkins timed out while waiting for Kubernetes Job {job} to complete."
+
+    deployment = finding.metadata.get("deployment")
+    if deployment:
+        return f"Jenkins timed out while waiting for deployment {deployment} to roll out."
+
+    return finding.root_cause if finding.root_cause else finding.title
 
 
 def _print_unknown(result: ScanResult, console: Console) -> None:
@@ -532,7 +562,7 @@ def _job_conclusion_lines(result: ScanResult) -> list[str]:
             lines.append(msg.job_log_excerpts_point_to_failure())
     elif result.job_context is not None:
         lines.append(msg.job_pod_logs_not_analyzed(result.job_context.job))
-    if result.warnings:
+    if result.warnings and not completed_now:
         lines.append(msg.cluster_state_may_differ())
     return list(dict.fromkeys(line for line in lines if line))
 
@@ -617,10 +647,15 @@ def _has_strong_explicit_root_cause(result: ScanResult) -> bool:
         return False
     strong_markers = (
         "ModuleNotFoundError",
+        "ImportError",
+        "Traceback",
         "ImagePullBackOff",
+        "ErrImagePull",
         "OOMKilled",
         "CrashLoopBackOff",
+        "CreateContainerConfigError",
         "permission denied",
+        "no space left on device",
         "missing Python module",
         "could not pull",
         "memory limits",
@@ -628,6 +663,24 @@ def _has_strong_explicit_root_cause(result: ScanResult) -> bool:
     )
     text = "\n".join([finding.root_cause, *finding.evidence])
     return any(marker.lower() in text.lower() for marker in strong_markers)
+
+
+def _has_confirmed_root_cause(result: ScanResult) -> bool:
+    if _has_strong_explicit_root_cause(result):
+        return True
+    return _has_strong_readiness_signal(result)
+
+
+def _has_strong_readiness_signal(result: ScanResult) -> bool:
+    return any(
+        insight.matched_pattern.lower() == "readiness probe failed"
+        and (
+            "connection refused" in insight.message.lower()
+            or "context deadline exceeded" in insight.message.lower()
+            or "timeout" in insight.message.lower()
+        )
+        for insight in _kubernetes_signal_insights(result)
+    )
 
 
 def save_markdown_report(result: ScanResult, path: Path) -> None:

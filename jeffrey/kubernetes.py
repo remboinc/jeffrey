@@ -69,26 +69,85 @@ class KubernetesCollector:
         self.debug_fn = debug_fn or self._debug
 
     def collect(self, namespace: str, deployment: str) -> KubernetesEvidence:
-        evidence = KubernetesEvidence(namespace=namespace, deployment=deployment)
+        environment = self.verify_environment()
+        failed_attempt_commands: list[CommandResult] = []
+        failed_attempt_errors: list[CommandResult] = []
+        failed_attempt_contexts: list[str] = []
 
-        evidence.environment = self.verify_environment()
-        evidence.executed_commands.extend(evidence.environment.commands)
-        for result in evidence.environment.commands:
+        for command_context, display_context in self._contexts_to_try(environment):
+            self.debug_fn(f"Trying Kubernetes context:\n{display_context}")
+            evidence = self._collect_deployment_in_context(
+                namespace,
+                deployment,
+                command_context=command_context,
+                display_context=display_context,
+                environment=environment,
+                previous_commands=failed_attempt_commands,
+                previous_errors=failed_attempt_errors,
+                previous_contexts=failed_attempt_contexts,
+            )
+            if not _resource_not_found(evidence.deployment_json):
+                return evidence
+            self.debug_fn(
+                f"Deployment {deployment} was not found in context {display_context}"
+            )
+            failed_attempt_commands.extend(
+                command
+                for command in evidence.executed_commands
+                if command not in environment.commands
+            )
+            failed_attempt_errors.extend(
+                command
+                for command in evidence.command_errors
+                if command not in environment.commands
+            )
+            failed_attempt_contexts.append(display_context)
+
+        return evidence
+
+    def _collect_deployment_in_context(
+        self,
+        namespace: str,
+        deployment: str,
+        *,
+        command_context: str | None,
+        display_context: str,
+        environment: EnvironmentCheck,
+        previous_commands: list[CommandResult],
+        previous_errors: list[CommandResult],
+        previous_contexts: list[str],
+    ) -> KubernetesEvidence:
+        evidence = KubernetesEvidence(
+            namespace=namespace,
+            deployment=deployment,
+            environment=environment,
+            context=display_context,
+            attempted_contexts=[*previous_contexts, display_context],
+        )
+        evidence.executed_commands.extend(environment.commands)
+        evidence.executed_commands.extend(previous_commands)
+        evidence.command_errors.extend(previous_errors)
+        for result in environment.commands:
             self._record_error(evidence, result)
 
         self.debug_fn("Collecting deployment evidence...")
         evidence.deployment_json = self._run(
-            ["kubectl", "get", "deployment", deployment, "-n", namespace, "-o", "json"]
+            ["kubectl", "get", "deployment", deployment, "-n", namespace, "-o", "json"],
+            context=command_context,
         )
         evidence.executed_commands.append(evidence.deployment_json)
         self._record_error(evidence, evidence.deployment_json)
+        if _resource_not_found(evidence.deployment_json):
+            return evidence
+
         evidence.selector = selector_from_deployment_json(evidence.deployment_json)
         evidence.selector_text = selector_to_text(evidence.selector)
         if evidence.selector_text:
             self.debug_fn(f"Deployment selector:\n{evidence.selector_text}")
 
         evidence.deployment_description = self._run(
-            ["kubectl", "describe", "deployment", deployment, "-n", namespace]
+            ["kubectl", "describe", "deployment", deployment, "-n", namespace],
+            context=command_context,
         )
         evidence.executed_commands.append(evidence.deployment_description)
         self._record_error(evidence, evidence.deployment_description)
@@ -110,7 +169,8 @@ class KubernetesCollector:
                     evidence.selector_text,
                     "-o",
                     "json",
-                ]
+                ],
+                context=command_context,
             )
             evidence.pods_json = evidence.labeled_pods_output
             evidence.executed_commands.append(evidence.labeled_pods_output)
@@ -123,13 +183,17 @@ class KubernetesCollector:
         if not selected_pods:
             evidence.fallback_pod_matching_used = True
             evidence.pods_json = self._run(
-                ["kubectl", "get", "pods", "-n", namespace, "-o", "json"]
+                ["kubectl", "get", "pods", "-n", namespace, "-o", "json"],
+                context=command_context,
             )
             evidence.executed_commands.append(evidence.pods_json)
             self._record_error(evidence, evidence.pods_json)
             selected_pods = identify_related_pods_from_json(evidence.pods_json, deployment)
 
-        evidence.pods_output = self._run(["kubectl", "get", "pods", "-n", namespace])
+        evidence.pods_output = self._run(
+            ["kubectl", "get", "pods", "-n", namespace],
+            context=command_context,
+        )
         evidence.executed_commands.append(evidence.pods_output)
         self._record_error(evidence, evidence.pods_output)
 
@@ -145,7 +209,8 @@ class KubernetesCollector:
 
         self.debug_fn("Collecting namespace event context...")
         evidence.namespace_events_output = self._run(
-            ["kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp"]
+            ["kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp"],
+            context=command_context,
         )
         evidence.events_output = evidence.namespace_events_output
         evidence.executed_commands.append(evidence.namespace_events_output)
@@ -155,7 +220,10 @@ class KubernetesCollector:
         self.debug_fn("Collecting container logs...")
         for pod_name in evidence.selected_pods:
             self.debug_fn(f"Selected pod:\n{pod_name}")
-            describe_result = self._run(["kubectl", "describe", "pod", pod_name, "-n", namespace])
+            describe_result = self._run(
+                ["kubectl", "describe", "pod", pod_name, "-n", namespace],
+                context=command_context,
+            )
             evidence.pod_descriptions[pod_name] = describe_result
             evidence.executed_commands.append(describe_result)
             self._record_error(evidence, describe_result)
@@ -169,21 +237,24 @@ class KubernetesCollector:
                     namespace,
                     f"--field-selector=involvedObject.name={pod_name}",
                     "--sort-by=.lastTimestamp",
-                ]
+                ],
+                context=command_context,
             )
             evidence.pod_events[pod_name] = pod_events_result
             evidence.executed_commands.append(pod_events_result)
             self._record_error(evidence, pod_events_result)
 
             logs_result = self._run(
-                ["kubectl", "logs", pod_name, "-n", namespace, "--tail=200"]
+                ["kubectl", "logs", pod_name, "-n", namespace, "--tail=200"],
+                context=command_context,
             )
             evidence.pod_logs[pod_name] = logs_result
             evidence.executed_commands.append(logs_result)
             self._record_error(evidence, logs_result)
 
             previous_logs_result = self._run(
-                ["kubectl", "logs", pod_name, "-n", namespace, "--previous", "--tail=200"]
+                ["kubectl", "logs", pod_name, "-n", namespace, "--previous", "--tail=200"],
+                context=command_context,
             )
             evidence.pod_previous_logs[pod_name] = previous_logs_result
             evidence.executed_commands.append(previous_logs_result)
@@ -196,21 +267,82 @@ class KubernetesCollector:
         return evidence
 
     def collect_job(self, namespace: str, job: str) -> KubernetesJobEvidence:
-        evidence = KubernetesJobEvidence(namespace=namespace, job=job)
+        environment = self.verify_environment()
+        failed_attempt_commands: list[CommandResult] = []
+        failed_attempt_errors: list[CommandResult] = []
+        failed_attempt_contexts: list[str] = []
 
-        evidence.environment = self.verify_environment()
-        evidence.executed_commands.extend(evidence.environment.commands)
-        for result in evidence.environment.commands:
+        for command_context, display_context in self._contexts_to_try(environment):
+            self.debug_fn(f"Trying Kubernetes context:\n{display_context}")
+            evidence = self._collect_job_in_context(
+                namespace,
+                job,
+                command_context=command_context,
+                display_context=display_context,
+                environment=environment,
+                previous_commands=failed_attempt_commands,
+                previous_errors=failed_attempt_errors,
+                previous_contexts=failed_attempt_contexts,
+            )
+            if not _resource_not_found(evidence.job_json):
+                return evidence
+            self.debug_fn(f"Job {job} was not found in context {display_context}")
+            failed_attempt_commands.extend(
+                command
+                for command in evidence.executed_commands
+                if command not in environment.commands
+            )
+            failed_attempt_errors.extend(
+                command
+                for command in evidence.command_errors
+                if command not in environment.commands
+            )
+            failed_attempt_contexts.append(display_context)
+
+        return evidence
+
+    def _collect_job_in_context(
+        self,
+        namespace: str,
+        job: str,
+        *,
+        command_context: str | None,
+        display_context: str,
+        environment: EnvironmentCheck,
+        previous_commands: list[CommandResult],
+        previous_errors: list[CommandResult],
+        previous_contexts: list[str],
+    ) -> KubernetesJobEvidence:
+        evidence = KubernetesJobEvidence(
+            namespace=namespace,
+            job=job,
+            environment=environment,
+            context=display_context,
+            attempted_contexts=[*previous_contexts, display_context],
+        )
+        evidence.executed_commands.extend(environment.commands)
+        evidence.executed_commands.extend(previous_commands)
+        evidence.command_errors.extend(previous_errors)
+        for result in environment.commands:
             self._record_error(evidence, result)
 
         self.debug_fn("Collecting Job evidence...")
-        evidence.job_description = self._run(["kubectl", "describe", "job", job, "-n", namespace])
+        evidence.job_json = self._run(
+            ["kubectl", "get", "job", job, "-n", namespace, "-o", "json"],
+            context=command_context,
+        )
+        evidence.executed_commands.append(evidence.job_json)
+        self._record_error(evidence, evidence.job_json)
+        if _resource_not_found(evidence.job_json):
+            return evidence
+
+        evidence.job_description = self._run(
+            ["kubectl", "describe", "job", job, "-n", namespace],
+            context=command_context,
+        )
         evidence.executed_commands.append(evidence.job_description)
         self._record_error(evidence, evidence.job_description)
 
-        evidence.job_json = self._run(["kubectl", "get", "job", job, "-n", namespace, "-o", "json"])
-        evidence.executed_commands.append(evidence.job_json)
-        self._record_error(evidence, evidence.job_json)
         evidence.selector = selector_from_job_json(evidence.job_json)
         evidence.selector_text = selector_to_text(evidence.selector)
 
@@ -228,7 +360,8 @@ class KubernetesCollector:
                     evidence.selector_text,
                     "-o",
                     "json",
-                ]
+                ],
+                context=command_context,
             )
             evidence.executed_commands.append(evidence.job_pods_json)
             self._record_error(evidence, evidence.job_pods_json)
@@ -243,7 +376,8 @@ class KubernetesCollector:
                 break
             evidence.fallback_label_used = label
             evidence.job_pods_json = self._run(
-                ["kubectl", "get", "pods", "-n", namespace, "-l", label, "-o", "json"]
+                ["kubectl", "get", "pods", "-n", namespace, "-l", label, "-o", "json"],
+                context=command_context,
             )
             evidence.executed_commands.append(evidence.job_pods_json)
             self._record_error(evidence, evidence.job_pods_json)
@@ -253,10 +387,14 @@ class KubernetesCollector:
         label_for_text = evidence.selector_text or evidence.fallback_label_used
         if label_for_text:
             evidence.job_pods_output = self._run(
-                ["kubectl", "get", "pods", "-n", namespace, "-l", label_for_text]
+                ["kubectl", "get", "pods", "-n", namespace, "-l", label_for_text],
+                context=command_context,
             )
         else:
-            evidence.job_pods_output = self._run(["kubectl", "get", "pods", "-n", namespace])
+            evidence.job_pods_output = self._run(
+                ["kubectl", "get", "pods", "-n", namespace],
+                context=command_context,
+            )
         evidence.executed_commands.append(evidence.job_pods_output)
         self._record_error(evidence, evidence.job_pods_output)
 
@@ -267,20 +405,25 @@ class KubernetesCollector:
         }
 
         for pod_name in evidence.selected_pods:
-            describe_result = self._run(["kubectl", "describe", "pod", pod_name, "-n", namespace])
+            describe_result = self._run(
+                ["kubectl", "describe", "pod", pod_name, "-n", namespace],
+                context=command_context,
+            )
             evidence.pod_descriptions[pod_name] = describe_result
             evidence.executed_commands.append(describe_result)
             self._record_error(evidence, describe_result)
 
             logs_result = self._run(
-                ["kubectl", "logs", pod_name, "-n", namespace, "--tail=200"]
+                ["kubectl", "logs", pod_name, "-n", namespace, "--tail=200"],
+                context=command_context,
             )
             evidence.pod_logs[pod_name] = logs_result
             evidence.executed_commands.append(logs_result)
             self._record_error(evidence, logs_result)
 
             previous_logs_result = self._run(
-                ["kubectl", "logs", pod_name, "-n", namespace, "--previous", "--tail=200"]
+                ["kubectl", "logs", pod_name, "-n", namespace, "--previous", "--tail=200"],
+                context=command_context,
             )
             evidence.pod_previous_logs[pod_name] = previous_logs_result
             evidence.executed_commands.append(previous_logs_result)
@@ -295,7 +438,8 @@ class KubernetesCollector:
                     namespace,
                     f"--field-selector=involvedObject.name={pod_name}",
                     "--sort-by=.lastTimestamp",
-                ]
+                ],
+                context=command_context,
             )
             evidence.pod_events[pod_name] = pod_events_result
             evidence.executed_commands.append(pod_events_result)
@@ -331,6 +475,17 @@ class KubernetesCollector:
             check.current_context = context.stdout.strip()
             self.debug_fn(f"current context:\n{check.current_context}")
 
+        contexts = self._run(["kubectl", "config", "get-contexts", "-o", "name"])
+        check.commands.append(contexts)
+        if contexts.succeeded:
+            check.contexts = [
+                line.strip()
+                for line in contexts.stdout.splitlines()
+                if line.strip()
+            ]
+            if check.contexts:
+                self.debug_fn("available contexts:\n" + "\n".join(check.contexts))
+
         namespace = self._run(
             ["kubectl", "config", "view", "--minify", "--output", "jsonpath={..namespace}"]
         )
@@ -341,7 +496,8 @@ class KubernetesCollector:
 
         return check
 
-    def _run(self, command: list[str]) -> CommandResult:
+    def _run(self, command: list[str], *, context: str | None = None) -> CommandResult:
+        command = _command_with_context(command, context)
         if self.show_commands:
             self.console.print(f"$ {' '.join(command)}")
         self.debug_fn("Running:\n" + " ".join(command))
@@ -364,6 +520,29 @@ class KubernetesCollector:
     def _debug(self, message: str) -> None:
         if self.debug:
             self.console.print(f"[dim][DEBUG] {message}[/dim]")
+
+    def _contexts_to_try(self, environment: EnvironmentCheck) -> list[tuple[str | None, str]]:
+        current_context = environment.current_context or "current"
+        contexts: list[tuple[str | None, str]] = [(None, current_context)]
+        for context in environment.contexts:
+            if context == environment.current_context:
+                continue
+            contexts.append((context, context))
+        return contexts
+
+
+def _command_with_context(command: list[str], context: str | None) -> list[str]:
+    if context is None or not command or command[0] != "kubectl":
+        return command
+    return ["kubectl", "--context", context, *command[1:]]
+
+
+def _resource_not_found(result: CommandResult | None) -> bool:
+    if result is None or result.succeeded:
+        return False
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    compact = text.replace(" ", "")
+    return "not found" in text or "notfound" in compact
 
 
 def identify_related_pods(
