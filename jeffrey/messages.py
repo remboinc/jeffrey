@@ -323,6 +323,17 @@ def no_correlated_kubernetes_failure() -> str:
     return "No correlated Kubernetes pod failure was found in current cluster state."
 
 
+def kubernetes_access_denied(namespace: str) -> str:
+    return f"Kubernetes access denied for namespace {namespace}."
+
+
+def kubernetes_access_denied_conclusion() -> str:
+    return (
+        "Jeffrey could not inspect deployment, pods, events, or logs because the current "
+        "kube identity lacks RBAC permissions."
+    )
+
+
 def fallback_pod_matching_used() -> str:
     return "Pod selector lookup failed; fallback pod name matching was used"
 
@@ -448,6 +459,14 @@ def possible_readiness_timeout() -> tuple[str, ...]:
 
 def run_with_kubectl_access() -> str:
     return "Run Jeffrey from a machine with kubectl access."
+
+
+def run_with_jenkins_kube_access() -> str:
+    return "Run Jeffrey with the same kubeconfig or service account Jenkins used."
+
+
+def request_kubernetes_read_access() -> str:
+    return "Request read access to deployments, pods, events, and pods/log in the namespace."
 
 
 def check_deployment_selector() -> str:

@@ -86,10 +86,10 @@ class KubernetesCollector:
                 previous_errors=failed_attempt_errors,
                 previous_contexts=failed_attempt_contexts,
             )
-            if not _resource_not_found(evidence.deployment_json):
+            if not _resource_lookup_blocked(evidence.deployment_json):
                 return evidence
             self.debug_fn(
-                f"Deployment {deployment} was not found in context {display_context}"
+                f"Deployment {deployment} was not accessible in context {display_context}"
             )
             failed_attempt_commands.extend(
                 command
@@ -137,7 +137,7 @@ class KubernetesCollector:
         )
         evidence.executed_commands.append(evidence.deployment_json)
         self._record_error(evidence, evidence.deployment_json)
-        if _resource_not_found(evidence.deployment_json):
+        if _resource_lookup_blocked(evidence.deployment_json):
             return evidence
 
         evidence.selector = selector_from_deployment_json(evidence.deployment_json)
@@ -284,9 +284,9 @@ class KubernetesCollector:
                 previous_errors=failed_attempt_errors,
                 previous_contexts=failed_attempt_contexts,
             )
-            if not _resource_not_found(evidence.job_json):
+            if not _resource_lookup_blocked(evidence.job_json):
                 return evidence
-            self.debug_fn(f"Job {job} was not found in context {display_context}")
+            self.debug_fn(f"Job {job} was not accessible in context {display_context}")
             failed_attempt_commands.extend(
                 command
                 for command in evidence.executed_commands
@@ -333,7 +333,7 @@ class KubernetesCollector:
         )
         evidence.executed_commands.append(evidence.job_json)
         self._record_error(evidence, evidence.job_json)
-        if _resource_not_found(evidence.job_json):
+        if _resource_lookup_blocked(evidence.job_json):
             return evidence
 
         evidence.job_description = self._run(
@@ -537,12 +537,23 @@ def _command_with_context(command: list[str], context: str | None) -> list[str]:
     return ["kubectl", "--context", context, *command[1:]]
 
 
-def _resource_not_found(result: CommandResult | None) -> bool:
+def resource_forbidden(result: CommandResult | None) -> bool:
+    if result is None or result.succeeded:
+        return False
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    return "forbidden" in text or "cannot get resource" in text
+
+
+def resource_not_found(result: CommandResult | None) -> bool:
     if result is None or result.succeeded:
         return False
     text = f"{result.stdout}\n{result.stderr}".lower()
     compact = text.replace(" ", "")
     return "not found" in text or "notfound" in compact
+
+
+def _resource_lookup_blocked(result: CommandResult | None) -> bool:
+    return resource_not_found(result) or resource_forbidden(result)
 
 
 def identify_related_pods(

@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from jeffrey import messages as msg
+from jeffrey.kubernetes import resource_forbidden
 from jeffrey.models import Finding, ScanResult
 
 
@@ -254,13 +255,19 @@ def _default_evidence_lines(finding: Finding, result: ScanResult) -> list[str]:
         lines.append(evidence)
 
     signals = _kubernetes_signal_insights(result)
-    if signals:
+    if _kubernetes_access_denied(result):
+        namespace = finding.metadata.get("namespace", msg.UNKNOWN_VALUE)
+        lines.append(msg.kubernetes_access_denied(namespace))
+    elif signals:
         lines.extend(_evidence_from_kubernetes_signals(signals))
     elif finding.metadata.get("has_k8s_evidence") == "true":
         lines.append(msg.no_correlated_kubernetes_failure())
 
     if finding.metadata.get("has_k8s_evidence") == "true":
-        if finding.metadata.get("fallback_pod_matching_used") == "true":
+        if (
+            finding.metadata.get("fallback_pod_matching_used") == "true"
+            and not _kubernetes_access_denied(result)
+        ):
             lines.append(msg.fallback_pod_matching_used())
         if len(lines) <= 2:
             lines.append(msg.no_deeper_kubernetes_cause())
@@ -450,6 +457,8 @@ def _jeffrey_conclusion_lines(result: ScanResult) -> list[str]:
         return _job_conclusion_lines(result)
 
     lines = [_root_cause_conclusion(finding.root_cause)]
+    if _kubernetes_access_denied(result):
+        lines.append(msg.kubernetes_access_denied_conclusion())
     signals = _kubernetes_signal_insights(result)
     if signals:
         lines.append(_readiness_behavior_conclusion(signals))
@@ -487,7 +496,10 @@ def _readiness_behavior_conclusion(insights: list) -> str:
 def _manual_follow_up_lines(result: ScanResult) -> list[str]:
     if result.job_evidence is not None:
         lines = []
-        if not result.job_evidence.selected_pods:
+        if _job_access_denied(result):
+            lines.append(msg.run_with_jenkins_kube_access())
+            lines.append(msg.request_kubernetes_read_access())
+        elif not result.job_evidence.selected_pods:
             lines.append(msg.check_deployment_selector())
         if any(
             excerpt.matched_pattern == "logs unavailable"
@@ -503,7 +515,10 @@ def _manual_follow_up_lines(result: ScanResult) -> list[str]:
     lines = []
     if evidence.environment is not None and not evidence.environment.kubectl_found:
         lines.append(msg.run_with_kubectl_access())
-    if not evidence.selected_pods:
+    if _kubernetes_access_denied(result):
+        lines.append(msg.run_with_jenkins_kube_access())
+        lines.append(msg.request_kubernetes_read_access())
+    elif not evidence.selected_pods:
         lines.append(msg.check_deployment_selector())
     if any(
         excerpt.matched_pattern == "logs unavailable"
@@ -511,6 +526,26 @@ def _manual_follow_up_lines(result: ScanResult) -> list[str]:
     ):
         lines.append(msg.check_pod_logs_manually())
     return lines
+
+
+def _kubernetes_access_denied(result: ScanResult) -> bool:
+    evidence = result.k8s_evidence
+    if evidence is None:
+        return False
+    return any(
+        resource_forbidden(command)
+        for command in (evidence.deployment_json, evidence.deployment_description)
+    )
+
+
+def _job_access_denied(result: ScanResult) -> bool:
+    evidence = result.job_evidence
+    if evidence is None:
+        return False
+    return any(
+        resource_forbidden(command)
+        for command in (evidence.job_json, evidence.job_description)
+    )
 
 
 def _print_job_kubernetes_signal(result: ScanResult, console: Console) -> None:

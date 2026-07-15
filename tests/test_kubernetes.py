@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 
-from jeffrey.kubernetes import identify_related_pods, run_command
+from jeffrey.kubernetes import identify_related_pods, resource_forbidden, run_command
 from jeffrey.models import CommandResult
 
 
@@ -48,3 +48,16 @@ def test_kubectl_command_timeout_does_not_crash(monkeypatch) -> None:
     assert result.exit_code is None
     assert result.timed_out is True
     assert "timed out" in result.stderr
+
+
+def test_resource_forbidden_detects_rbac_error() -> None:
+    result = CommandResult(
+        command=["kubectl", "get", "deployment", "web-app"],
+        exit_code=1,
+        stderr=(
+            'Error from server (Forbidden): deployments.apps "web-app" is forbidden: '
+            'User "developer@example.com" cannot get resource "deployments"'
+        ),
+    )
+
+    assert resource_forbidden(result) is True
