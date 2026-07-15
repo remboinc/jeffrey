@@ -751,6 +751,51 @@ def test_forbidden_kubernetes_access_reports_rbac_follow_up(
     assert "Check the deployment selector." not in rendered
 
 
+def test_forbidden_in_any_context_reports_rbac_even_if_final_context_is_not_found(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = _write_failed_rollout_log(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fake_run(command, **kwargs):
+        normalized_command = _strip_kubectl_context(command)
+        if command == ["kubectl", "config", "current-context"]:
+            return subprocess.CompletedProcess(command, 0, stdout="ctx-a\n", stderr="")
+        if command == ["kubectl", "config", "get-contexts", "-o", "name"]:
+            return subprocess.CompletedProcess(command, 0, stdout="ctx-a\nctx-b\n", stderr="")
+        if normalized_command[:5] == ["kubectl", "get", "deployment", "web-app", "-n"]:
+            if "--context" not in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr=(
+                        'Error from server (Forbidden): deployments.apps "web-app" is '
+                        "forbidden: User cannot get resource deployments"
+                    ),
+                )
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr='Error from server (NotFound): deployments.apps "web-app" not found',
+            )
+        return _completed(normalized_command)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = investigate_build_log(log_path)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False)
+    print_report(result, console=console)
+
+    rendered = output.getvalue()
+    assert "Kubernetes access denied for namespace demo." in rendered
+    assert "lacks RBAC permissions" in rendered
+    assert "Check the deployment selector." not in rendered
+
+
 def test_jenkins_rollout_values_are_stored_and_reused(tmp_path: Path, monkeypatch) -> None:
     log_path = _write_failed_rollout_log(tmp_path)
     monkeypatch.chdir(tmp_path)

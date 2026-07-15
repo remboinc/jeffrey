@@ -534,7 +534,11 @@ def _kubernetes_access_denied(result: ScanResult) -> bool:
         return False
     return any(
         resource_forbidden(command)
-        for command in (evidence.deployment_json, evidence.deployment_description)
+        for command in (
+            evidence.deployment_json,
+            evidence.deployment_description,
+            *evidence.command_errors,
+        )
     )
 
 
@@ -544,7 +548,11 @@ def _job_access_denied(result: ScanResult) -> bool:
         return False
     return any(
         resource_forbidden(command)
-        for command in (evidence.job_json, evidence.job_description)
+        for command in (
+            evidence.job_json,
+            evidence.job_description,
+            *evidence.command_errors,
+        )
     )
 
 
